@@ -3,8 +3,8 @@
   "name": "Bambu Lab",
   "driver_key": "bambulab",
   "plugin_type": "driver",
-  "version": "2.7.3",
-  "description": "Bambu Lab printer driver via bambulabs_api with AMS and all-spool gallery views, optional catalog images, RFID spool discovery and automatic filament matching. Note: Sending filament settings (spool assignment) requires LAN-only mode AND Developer Mode enabled on the printer. Read-only mode never sends state-changing MQTT commands.",
+  "version": "2.9.4",
+  "description": "Bambu Lab printer driver via bambulabs_api with AMS and all-spool gallery views, optional catalog images, RFID spool discovery, estimated-weight synchronization and automatic filament matching. Note: Sending filament settings (spool assignment) requires LAN-only mode AND Developer Mode enabled on the printer. Read-only mode never sends state-changing MQTT commands.",
   "author": "FilaMan",
   "homepage": "https://www.filaman.app",
   "page_url": "/plugin-page/bambulab",
@@ -45,7 +45,13 @@
       "auto_import_spools": {
         "type": "boolean",
         "title": "Automatically Import Bambu RFID Spools",
-        "description": "Create unknown Bambu RFID spools from existing filaments and keep their estimated remaining weight synchronized",
+        "description": "Create unknown Bambu RFID spools from existing filaments",
+        "default": false
+      },
+      "sync_spool_weight": {
+        "type": "boolean",
+        "title": "Synchronize Estimated Spool Weight",
+        "description": "Set and update remaining spool weight from Bambu Lab's tray weight and remaining-percentage estimates during automatic spool import",
         "default": false
       },
       "resolve_shop_images": {

@@ -10,7 +10,7 @@ import time
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm.attributes import flag_modified
 
@@ -23,7 +23,7 @@ from app.models.spool import Spool, SpoolStatus
 from app.models.system_extra_field import SystemExtraField
 from app.services.spool_service import SpoolService
 
-from .catalog import _evict_expired
+from .catalog import ARTICLE_NUMBER_FIELD, _evict_expired
 
 logger = logging.getLogger(__name__)
 
@@ -35,18 +35,34 @@ BAMBU_EXTERNAL_ID_PREFIX = "bambulab:"
 
 class SpoolSyncMixin:
     """Provide RFID matching, database synchronization and location updates."""
-    async def _ensure_rfid_extra_fields(self) -> None:
-        """Create the two spool fields used for the physical Bambu RFID tags."""
+    async def _ensure_shared_extra_fields(self) -> None:
+        """Expose the filament article number and physical Bambu RFID tags."""
         field_defs = (
-            (BAMBU_RFID_TAG_1_FIELD, "Bambu RFID Tag 1"),
-            (BAMBU_RFID_TAG_2_FIELD, "Bambu RFID Tag 2"),
+            (
+                "filament",
+                ARTICLE_NUMBER_FIELD,
+                "Bambu Color Code (Article Number)",
+                {"max_length": 5},
+            ),
+            (
+                "spool",
+                BAMBU_RFID_TAG_1_FIELD,
+                "Bambu RFID Tag 1",
+                {"max_length": 32},
+            ),
+            (
+                "spool",
+                BAMBU_RFID_TAG_2_FIELD,
+                "Bambu RFID Tag 2",
+                {"max_length": 32},
+            ),
         )
         try:
             async with async_session_maker() as db:
-                for key, label in field_defs:
+                for target_type, key, label, config in field_defs:
                     result = await db.execute(
                         select(SystemExtraField).where(
-                            SystemExtraField.target_type == "spool",
+                            SystemExtraField.target_type == target_type,
                             SystemExtraField.key == key,
                         )
                     )
@@ -54,17 +70,17 @@ class SpoolSyncMixin:
                     if field is None:
                         db.add(
                             SystemExtraField(
-                                target_type="spool",
+                                target_type=target_type,
                                 key=key,
                                 label=label,
                                 field_type="text",
                                 source=self.driver_key,
-                                config={"max_length": 32},
+                                config=config,
                             )
                         )
                 await db.commit()
         except Exception as e:
-            logger.error(f"Failed to ensure Bambu RFID extra fields: {e}")
+            logger.error(f"Failed to ensure shared Bambu extra fields: {e}")
 
     async def _find_matching_filament(self, db, slot: dict[str, Any]) -> Filament | None:
         """Find one existing filament; never create catalog data implicitly."""
@@ -137,18 +153,106 @@ class SpoolSyncMixin:
             )
         return selected
 
-    async def _find_existing_bambu_spool(
-        self, db, external_id: str
+    @staticmethod
+    def _spoolman_import_tags(custom_fields: Any) -> tuple[Any, ...]:
+        """Possible tray UUIDs left by different Spoolman import versions.
+
+        Depending on the age of the import it sits directly under ``tag`` or
+        nested under ``spoolman_extra.tag``. Return both because one field may
+        contain unrelated legacy data while the other carries the tray UUID.
+        """
+        if not isinstance(custom_fields, dict):
+            return ()
+        extra = custom_fields.get("spoolman_extra")
+        return tuple(
+            value
+            for value in (
+                custom_fields.get("tag"),
+                extra.get("tag") if isinstance(extra, dict) else None,
+            )
+            if value
+        )
+
+    def _pick_oldest_match(
+        self, matches: list[Spool], tray_uuid: str, carried_in: str
     ) -> Spool | None:
-        """Find an already imported Bambu spool by its stable external ID."""
+        """One spool out of the candidates, oldest first, with a word about it."""
+        if not matches:
+            return None
+        if len(matches) > 1:
+            logger.warning(
+                "Multiple FilaMan spools carry Bambu tray_uuid=%s in %s; "
+                "using the oldest spool id", tray_uuid, carried_in
+            )
+        spool = min(matches, key=lambda candidate: candidate.id)
+        logger.info(
+            "Matched existing FilaMan spool %s by %s for Bambu tray_uuid=%s",
+            spool.id, carried_in, tray_uuid
+        )
+        return spool
+
+    async def _find_existing_bambu_spool(
+        self, db, external_id: str, tray_uuid: str
+    ) -> Spool | None:
+        """Find a spool already representing this tray, wherever it carries it."""
         result = await db.execute(
             select(Spool).where(Spool.external_id == external_id)
         )
-        return result.scalar_one_or_none()
+        spool = result.scalar_one_or_none()
+        if spool is not None:
+            return spool
+
+        # Some importers stored Bambu's logical tray UUID in FilaMan's built-in
+        # RFID field before ``external_id`` became the canonical integration
+        # identity. Normalize candidate values so case and common separators do
+        # not cause the same physical spool to be imported a second time.
+        result = await db.execute(
+            select(Spool).where(Spool.rfid_uid.is_not(None))
+        )
+        spool = self._pick_oldest_match(
+            [
+                candidate
+                for candidate in result.scalars().all()
+                if self._normalize_hex_identifier(candidate.rfid_uid, 32)
+                == tray_uuid
+            ],
+            tray_uuid,
+            "rfid_uid",
+        )
+        if spool is not None:
+            return spool
+
+        # Spools that reached FilaMan through its Spoolman import keep the tray
+        # uuid in their custom fields, where neither lookup above can see it.
+        # Without this the import treats a spool FilaMan already has as unknown
+        # and creates a second record for the same physical spool, which then
+        # wins every later lookup through its own external_id.
+        result = await db.execute(
+            select(Spool).where(Spool.custom_fields.is_not(None))
+        )
+        return self._pick_oldest_match(
+            [
+                candidate
+                for candidate in result.scalars().all()
+                if any(
+                    self._normalize_hex_identifier(value, 32) == tray_uuid
+                    for value in self._spoolman_import_tags(
+                        candidate.custom_fields
+                    )
+                )
+            ],
+            tray_uuid,
+            "custom fields of the Spoolman import",
+        )
 
     def _schedule_auto_import(self, slots: list[dict[str, Any]]) -> None:
-        """Queue eligible RFID trays for a rate-limited asynchronous upsert."""
-        if not self._auto_import_spools or not self._loop or not self._running:
+        """Queue eligible RFID trays for a rate-limited asynchronous lookup.
+
+        Runs whether or not spools may be created: recognising the spool in a
+        tray is what fills the tray-uuid index, and that index is the only
+        thing that puts a spool into a slot.
+        """
+        if not self._loop or not self._running:
             return
 
         now = time.monotonic()
@@ -171,10 +275,46 @@ class SpoolSyncMixin:
             lambda: asyncio.create_task(self._auto_import_rfid_spools(candidates))
         )
 
+    def _schedule_slot_location_release(self, slot_index: str) -> None:
+        """Queue the location cleanup for a tray that just went empty."""
+        parsed = self._parse_slot_index(slot_index)
+        if not parsed or not self._loop:
+            return
+        ams_id, tray_id = parsed
+        self._loop.call_soon_threadsafe(
+            lambda: asyncio.create_task(
+                self._release_slot_location(ams_id, tray_id)
+            )
+        )
+
+    def _schedule_slot_location_update(
+        self, slot_index: str, spool_id: int
+    ) -> None:
+        """Queue a known replacement spool for its slot location."""
+        parsed = self._parse_slot_index(slot_index)
+        if not parsed or not self._loop:
+            return
+        ams_id, tray_id = parsed
+        self._loop.call_soon_threadsafe(
+            lambda: asyncio.create_task(
+                self._update_spool_location(
+                    spool_id,
+                    ams_id,
+                    tray_id,
+                )
+            )
+        )
+
     async def _auto_import_rfid_spools(
         self, slots: list[dict[str, Any]]
     ) -> None:
-        """Idempotently create or update FilaMan spools from RFID tray data."""
+        """Recognise the spool in each RFID tray, and import it where allowed.
+
+        Recognition always runs, because the tray-uuid index it fills is what
+        assigns a spool to a slot. ``auto_import_spools`` decides only whether
+        a tray FilaMan does not know may become a new spool, and whether a
+        known one may be written to.
+        """
         if not self._auto_import_lock:
             return
 
@@ -191,12 +331,22 @@ class SpoolSyncMixin:
                 created = False
                 dirty = False
                 weight_changed = False
-                estimated_weight = self._estimated_remaining_weight(slot)
+                estimated_weight = (
+                    self._estimated_remaining_weight(slot)
+                    if self._sync_spool_weight
+                    else None
+                )
 
                 async with async_session_maker() as db:
-                    spool = await self._find_existing_bambu_spool(db, external_id)
+                    spool = await self._find_existing_bambu_spool(
+                        db, external_id, tray_uuid
+                    )
 
                     if spool is None:
+                        if not self._auto_import_spools:
+                            # Nothing known and nothing may be created, so this
+                            # tray simply stays unassigned.
+                            continue
                         filament = await self._find_matching_filament(db, slot)
                         if filament is None:
                             logger.warning(
@@ -249,7 +399,7 @@ class SpoolSyncMixin:
                             spool = result.scalar_one_or_none()
                             if spool is None:
                                 raise
-                    else:
+                    elif self._auto_import_spools:
                         custom_fields = dict(spool.custom_fields or {})
                         if tag_uid and not custom_fields.get(BAMBU_RFID_TAG_1_FIELD):
                             custom_fields[BAMBU_RFID_TAG_1_FIELD] = tag_uid
@@ -345,6 +495,199 @@ class SpoolSyncMixin:
             slot_label = chr(65 + tray_id)  # 65 = 'A' in ASCII
             return f"{printer_name} - AMS {slot_label}{ams_id + 1}"
 
+    def _generate_slot_location_identifier(self, ams_id: int, tray_id: int) -> str:
+        """Return the stable database identity for one physical printer slot."""
+        return f"bambulab_{self.printer_id}_{ams_id}_{tray_id}"
+
+    def _generate_legacy_slot_location_name(self, ams_id: int, tray_id: int) -> str:
+        """Return the fallback name used before printer names loaded correctly."""
+        current_printer_name = self._printer_name or f"Printer {self.printer_id}"
+        current_name = self._generate_slot_location_name(ams_id, tray_id)
+        prefix = f"{current_printer_name} - "
+        suffix = current_name.removeprefix(prefix)
+        return f"Printer {self.printer_id} - {suffix}"
+
+    def _adopt_legacy_slot_location(
+        self, location: Location, identifier: str
+    ) -> Location:
+        """Attach stable identity and current ownership metadata to a legacy row."""
+        location.identifier = identifier
+        self._refresh_slot_location_metadata(location)
+        logger.info(
+            "Adopted legacy Bambu slot location '%s' as %s",
+            location.name,
+            identifier,
+        )
+        return location
+
+    def _refresh_slot_location_metadata(self, location: Location) -> None:
+        """Ensure a managed slot records its current plugin ownership."""
+        custom_fields = (
+            dict(location.custom_fields)
+            if isinstance(location.custom_fields, dict)
+            else {}
+        )
+        custom_fields.update(
+            {
+                "managed_by": "bambulab_plugin",
+                "printer_id": self.printer_id,
+            }
+        )
+        location.custom_fields = custom_fields
+
+    async def _find_slot_location(
+        self, db, ams_id: int, tray_id: int
+    ) -> Location | None:
+        """Find the stable slot or conservatively adopt an owned legacy row."""
+        identifier = self._generate_slot_location_identifier(ams_id, tray_id)
+        result = await db.execute(
+            select(Location).where(Location.identifier == identifier)
+        )
+        location = result.scalar_one_or_none()
+        if location is not None:
+            self._refresh_slot_location_metadata(location)
+            return location
+
+        # Current plugin versions always set an identifier. Only identifier-less
+        # rows can be legacy candidates; a manual or foreign location with its
+        # own identity must never be taken over merely because its name matches.
+        result = await db.execute(
+            select(Location).where(
+                or_(Location.identifier.is_(None), Location.identifier == "")
+            )
+        )
+        candidates = list(result.scalars().all())
+        legacy_name = self._generate_legacy_slot_location_name(ams_id, tray_id)
+        slot_suffix = legacy_name.split(" - ", 1)[-1]
+        managed_candidates = []
+        for candidate in candidates:
+            custom_fields = candidate.custom_fields or {}
+            if not isinstance(custom_fields, dict):
+                continue
+            if custom_fields.get("managed_by") != "bambulab_plugin":
+                continue
+            if str(custom_fields.get("printer_id")) != str(self.printer_id):
+                continue
+            if not str(candidate.name or "").casefold().endswith(
+                f" - {slot_suffix}".casefold()
+            ):
+                continue
+            managed_candidates.append(candidate)
+
+        if len(managed_candidates) == 1:
+            return self._adopt_legacy_slot_location(
+                managed_candidates[0], identifier
+            )
+        if len(managed_candidates) > 1:
+            logger.warning(
+                "Multiple identifier-less Bambu locations claim printer %s; "
+                "not adopting any for slot %s-%s",
+                self.printer_id,
+                ams_id,
+                tray_id,
+            )
+            return None
+
+        name_candidates = [
+            candidate
+            for candidate in candidates
+            if str(candidate.name or "").casefold() == legacy_name.casefold()
+        ]
+        if len(name_candidates) == 1:
+            return self._adopt_legacy_slot_location(name_candidates[0], identifier)
+        if len(name_candidates) > 1:
+            logger.warning(
+                "Multiple locations match legacy Bambu slot name '%s'; "
+                "not adopting any",
+                legacy_name,
+            )
+        return None
+
+    async def _unique_slot_location_name(
+        self,
+        db,
+        preferred_name: str,
+        identifier: str,
+    ) -> str:
+        """Keep names readable while separating equally named printers."""
+        result = await db.execute(select(Location))
+        locations = list(result.scalars().all())
+
+        def name_is_used_elsewhere(candidate_name: str) -> bool:
+            return any(
+                str(location.name or "").casefold() == candidate_name.casefold()
+                and location.identifier != identifier
+                for location in locations
+            )
+
+        if not name_is_used_elsewhere(preferred_name):
+            return preferred_name
+
+        collision_name = f"{preferred_name} [Printer {self.printer_id}]"
+        suffix = 2
+        while name_is_used_elsewhere(collision_name):
+            collision_name = (
+                f"{preferred_name} [Printer {self.printer_id} #{suffix}]"
+            )
+            suffix += 1
+        return collision_name
+
+    async def _clear_slot_location(
+        self, db, location: Location, location_name: str, keep_spool_id: int | None
+    ) -> int:
+        """Nimmt den Lagerort von jeder Spule, die nicht mehr darin liegt."""
+        result = await db.execute(
+            select(Spool).where(Spool.location_id == location.id)
+        )
+        stale = [
+            spool
+            for spool in result.scalars().all()
+            if spool.id != keep_spool_id
+        ]
+        if not stale:
+            return 0
+        service = SpoolService(db)
+        for spool in stale:
+            await service.move_location(
+                spool,
+                None,
+                datetime.now(timezone.utc),
+                source="driver",
+                note=f"No longer in {location_name}",
+            )
+            logger.info(
+                "Spool %s left location '%s'", spool.id, location_name
+            )
+        return len(stale)
+
+    async def _release_slot_location(self, ams_id: int, tray_id: int) -> None:
+        """Räumt den Lagerort eines Trays, aus dem die Spule gezogen wurde.
+
+        Ein leeres Tray sagt nichts mehr darüber aus, wo die Spule liegt. Ohne
+        dieses Aufräumen behauptet FilaMan weiterhin, sie sei im AMS, und der
+        Lagerort sammelt über die Zeit jede Spule, die je darin lag.
+        """
+        slot_location_name = self._generate_slot_location_name(ams_id, tray_id)
+        try:
+            async with async_session_maker() as db:
+                location = await self._find_slot_location(db, ams_id, tray_id)
+                if location is None:
+                    return
+                await self._clear_slot_location(
+                    db,
+                    location,
+                    location.name or slot_location_name,
+                    keep_spool_id=None,
+                )
+                # Also persists a conservative legacy-location adoption even if
+                # the already-empty location contained no spool to release.
+                await db.commit()
+        except Exception as e:
+            logger.error(
+                f"Failed to release location for slot {ams_id}-{tray_id}: {e}",
+                exc_info=True,
+            )
+
     async def _update_spool_location(
         self, filaman_spool_id: int, ams_id: int, tray_id: int
     ) -> None:
@@ -354,22 +697,24 @@ class SpoolSyncMixin:
         Nutzt SpoolService.move_location() für konsistente Event-Generierung.
         """
         try:
-            slot_location_name = self._generate_slot_location_name(ams_id, tray_id)
+            preferred_name = self._generate_slot_location_name(ams_id, tray_id)
+            identifier = self._generate_slot_location_identifier(ams_id, tray_id)
 
             async with async_session_maker() as db:
-                # 1. Location suchen (case-insensitive)
-                result = await db.execute(
-                    select(Location).where(
-                        func.lower(Location.name) == slot_location_name.lower()
-                    )
+                # The identifier represents the physical slot. Its display name
+                # may change when the printer is renamed and is not an identity.
+                location = await self._find_slot_location(db, ams_id, tray_id)
+                slot_location_name = await self._unique_slot_location_name(
+                    db,
+                    preferred_name,
+                    identifier,
                 )
-                location = result.scalar_one_or_none()
 
                 # 2. Location erstellen falls nicht vorhanden
                 if not location:
                     location = Location(
                         name=slot_location_name,
-                        identifier=f"bambulab_{self.printer_id}_{ams_id}_{tray_id}",
+                        identifier=identifier,
                         custom_fields={
                             "managed_by": "bambulab_plugin",
                             "printer_id": self.printer_id,
@@ -378,6 +723,13 @@ class SpoolSyncMixin:
                     db.add(location)
                     await db.flush()  # Für location.id
                     logger.info(f"Created location: {slot_location_name}")
+                elif location.name != slot_location_name:
+                    logger.info(
+                        "Renamed managed location '%s' to '%s'",
+                        location.name,
+                        slot_location_name,
+                    )
+                    location.name = slot_location_name
 
                 # 3. Spule zur Location bewegen (wenn nicht bereits dort)
                 spool = await db.get(Spool, filaman_spool_id)
@@ -387,10 +739,17 @@ class SpoolSyncMixin:
                     )
                     return
 
+                # Ein Tray hält eine Spule. Wer sonst noch auf diesem Lagerort
+                # steht, lag früher einmal darin und liegt längst woanders.
+                await self._clear_slot_location(
+                    db, location, slot_location_name, keep_spool_id=filaman_spool_id
+                )
+
                 if spool.location_id == location.id:
                     logger.debug(
                         f"Spool {filaman_spool_id} already at location '{slot_location_name}'"
                     )
+                    await db.commit()
                     return
 
                 # SpoolService für konsistente Event-Generierung nutzen

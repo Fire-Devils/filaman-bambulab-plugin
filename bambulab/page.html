@@ -98,8 +98,6 @@
     button { cursor: pointer; }
 
     .shell { width: min(1440px, calc(100% - 32px)); margin: 0 auto; padding: 28px 0 56px; }
-    .page-nav { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 28px; }
-    .back-btn { text-decoration: none; }
 
     .hero {
       display: grid;
@@ -246,7 +244,6 @@
     }
     @media (max-width: 560px) {
       .shell { width: min(100% - 20px, 1440px); padding-top: 15px; }
-      .page-nav { margin-bottom: 22px; }
       .hero { gap: 18px; }
       .actions, .select, .btn { width: 100%; }
       .view-tabs { display: flex; width: 100%; }
@@ -265,12 +262,6 @@
 </head>
 <body>
   <main class="shell">
-        <nav class="page-nav">
-          <button id="back-button" class="btn back-btn" type="button">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="m15 18-6-6 6-6"/></svg>
-            <span data-i18n="page.back">Back to FilaMan</span>
-          </button>
-        </nav>
         <section class="hero">
           <div>
             <p class="eyebrow">Bambu Lab Plugin</p>
@@ -304,7 +295,7 @@
           'nav.plugins': 'Plugins', 'nav.admin': 'Admin', 'nav.adminPanel': 'Admin panel', 'nav.settings': 'Settings', 'nav.logout': 'Log out',
           'sidebar.toggle': 'Toggle sidebar', 'sidebar.navigation': 'Main navigation',
           'theme.label': 'Theme', 'theme.brand': 'Brand', 'theme.light': 'Light', 'theme.dark': 'Dark',
-          'page.back': 'Back to FilaMan', 'page.title': 'Spool overview', 'page.lead': 'All FilaMan spools in one gallery, plus live status for Bambu AMS systems.',
+          'page.title': 'Spool overview', 'page.lead': 'All FilaMan spools in one gallery, plus live status for Bambu AMS systems.',
           'page.managePrinters': 'Manage printers', 'page.selectPrinter': 'Select printer', 'page.allPrinters': 'All Bambu printers',
           'page.selectView': 'Select view', 'page.amsLive': 'AMS live', 'page.allSpools': 'All spools', 'page.summary': 'Summary',
           'page.footer': 'Catalog images belong to the shared filament and are reused by all matching spools. Bambu Lab is the first image provider; more manufacturers can be added later.',
@@ -340,7 +331,7 @@
           'nav.plugins': 'Plugins', 'nav.admin': 'Administration', 'nav.adminPanel': 'Administration', 'nav.settings': 'Einstellungen', 'nav.logout': 'Abmelden',
           'sidebar.toggle': 'Seitenleiste umschalten', 'sidebar.navigation': 'Hauptnavigation',
           'theme.label': 'Darstellung', 'theme.brand': 'Marke', 'theme.light': 'Hell', 'theme.dark': 'Dunkel',
-          'page.back': 'Zurück zu FilaMan', 'page.title': 'Spulenübersicht', 'page.lead': 'Alle FilaMan-Spulen als Galerie – plus Live-Status der Bambu-AMS-Systeme.',
+          'page.title': 'Spulenübersicht', 'page.lead': 'Alle FilaMan-Spulen als Galerie – plus Live-Status der Bambu-AMS-Systeme.',
           'page.managePrinters': 'Drucker verwalten', 'page.selectPrinter': 'Drucker auswählen', 'page.allPrinters': 'Alle Bambu-Drucker',
           'page.selectView': 'Ansicht auswählen', 'page.amsLive': 'AMS Live', 'page.allSpools': 'Alle Spulen', 'page.summary': 'Zusammenfassung',
           'page.footer': 'Katalogbilder gehören zum gemeinsamen Filament und werden dadurch für alle entsprechenden Spulen wiederverwendet. Bambu Lab ist der erste Bildanbieter; weitere Hersteller können später ergänzt werden.',
@@ -454,7 +445,9 @@
 
       const productCode = (slot, spool) => {
         const fields = spool?.filament?.custom_fields || {};
-        if (slot.bambu_product_code || fields.bambu_product_code) return slot.bambu_product_code || fields.bambu_product_code;
+        if (fields.article_number || slot.bambu_product_code || fields.bambu_product_code) {
+          return fields.article_number || slot.bambu_product_code || fields.bambu_product_code;
+        }
         const text = `${spool?.filament?.designation || ''} ${spool?.filament?.manufacturer_color_name || ''}`;
         return text.match(/(?:^|\D)(\d{5})(?:\D|$)/)?.[1] || '—';
       };
@@ -804,15 +797,6 @@
         } catch { /* The local language fallback remains usable. */ }
       };
 
-      document.getElementById('back-button').addEventListener('click', () => {
-        try {
-          if (document.referrer && new URL(document.referrer).origin === window.location.origin) {
-            window.history.back();
-            return;
-          }
-        } catch { /* Fall through to the dashboard. */ }
-        window.location.href = '/';
-      });
       viewTabs.forEach((tab) => tab.addEventListener('click', () => setView(tab.dataset.view)));
       refreshButton.addEventListener('click', () => activeView === 'ams' ? loadAms(true) : loadInventory(true));
       printerFilter.addEventListener('change', renderAms);

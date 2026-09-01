@@ -392,14 +392,57 @@ class SlotSupportMixin:
         slots = ams_slots + ext_slots
         for slot in slots:
             slot_index = str(slot.get("slot_index") or "")
+            previous = next(
+                (
+                    known
+                    for known in self._current_slots
+                    if str(known.get("slot_index") or "") == slot_index
+                ),
+                None,
+            )
+            previous_uuid = self._normalize_hex_identifier(
+                previous.get("tray_uuid") if previous else None, 32
+            )
             tray_uuid = self._normalize_hex_identifier(slot.get("tray_uuid"), 32)
+            spool_was_replaced = bool(
+                previous is not None
+                and previous.get("present")
+                and slot.get("present")
+                and previous_uuid
+                and tray_uuid
+                and previous_uuid != tray_uuid
+            )
+
+            if spool_was_replaced:
+                # The previous slot mapping must never leak into image lookup or
+                # FilaMan's PrinterSlotAssignment for the new tray contents.
+                self._slot_spool_ids.pop(slot_index, None)
+                self._slot_display_metadata.pop(slot_index, None)
+                slot["spool_id"] = None
+
+            known_spool_id: int | None = None
             if tray_uuid and tray_uuid in self._spool_ids_by_tray_uuid:
-                spool_id = self._spool_ids_by_tray_uuid[tray_uuid]
-                slot["spool_id"] = spool_id
-                self._slot_spool_ids[slot_index] = spool_id
+                known_spool_id = self._spool_ids_by_tray_uuid[tray_uuid]
+                slot["spool_id"] = known_spool_id
+                self._slot_spool_ids[slot_index] = known_spool_id
             elif not slot.get("present") and slot_index in self._slot_spool_ids:
                 slot["spool_id"] = None
                 self._slot_spool_ids.pop(slot_index, None)
+
+            if (
+                previous is not None
+                and previous.get("present")
+                and not slot.get("present")
+            ):
+                self._schedule_slot_location_release(slot_index)
+            elif spool_was_replaced:
+                if known_spool_id is not None:
+                    self._schedule_slot_location_update(
+                        slot_index,
+                        known_spool_id,
+                    )
+                else:
+                    self._schedule_slot_location_release(slot_index)
 
         # -- Auto-assignment: Tray-Daten-Vergleich (wie C++ Implementierung) --
         # Erkennt wenn sich Tray-Felder ändern (Spule eingelegt/gewechselt).
@@ -455,11 +498,28 @@ class SlotSupportMixin:
                     f"assigning pending spool {self._pending.spool_id}"
                 )
                 filaman_spool_id = self._pending.spool_id
-                dispatched = self._send_filament_setting(
+                # This is what puts the spool into the slot as far as FilaMan is
+                # concerned: the plugin manager turns slot["spool_id"] into the
+                # PrinterSlotAssignment. The filament setting below only tells
+                # the printer which material it is holding, and the printer has
+                # no idea that FilaMan spools exist.
+                if filaman_spool_id:
+                    new_slot["spool_id"] = filaman_spool_id
+                    self._slot_spool_ids[sid] = filaman_spool_id
+                    pending_tray_uuid = self._normalize_hex_identifier(
+                        new_slot.get("tray_uuid"), 32
+                    )
+                    if pending_tray_uuid:
+                        self._spool_ids_by_tray_uuid[pending_tray_uuid] = (
+                            filaman_spool_id
+                        )
+                self._send_filament_setting(
                     ams_id_parsed, tray_id_parsed, self._pending.filament_data
                 )
-                # Location nach erfolgreichem Auto-Assignment aktualisieren
-                if dispatched and self._loop and filaman_spool_id:
+                # The spool sits in that tray whether or not the printer was
+                # told about it, so the location follows the assignment and not
+                # the MQTT send.
+                if self._loop and filaman_spool_id:
                     self._loop.call_soon_threadsafe(
                         lambda: asyncio.create_task(
                             self._update_spool_location(
