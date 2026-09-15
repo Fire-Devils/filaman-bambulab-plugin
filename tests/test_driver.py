@@ -244,7 +244,7 @@ class PluginPageTests(unittest.TestCase):
         plugin_dir = Path(__file__).resolve().parents[1] / "bambulab"
         manifest = json.loads((plugin_dir / "plugin.json").read_text())
 
-        self.assertEqual(manifest["version"], "2.8.0")
+        self.assertRegex(manifest["version"], r"^\d+\.\d+\.\d+(?:-dev\.[1-9]\d*)?$")
         self.assertEqual(manifest["page_url"], "/plugin-page/bambulab")
         self.assertTrue(manifest["show_in_nav"])
         self.assertFalse(
@@ -769,6 +769,26 @@ class SlotProcessingTests(unittest.TestCase):
 
 
 class ReadOnlyTests(unittest.IsolatedAsyncioTestCase):
+    async def test_direct_assignment_in_read_only_records_spool_without_mqtt(self):
+        """Manual non-RFID assignment must work with each supported ID handoff."""
+        for data, explicit_id in (({}, 42), ({"id": 42}, None), ({"filaman_spool_id": 42}, None)):
+            with self.subTest(data=data, explicit_id=explicit_id):
+                driver, events = make_driver(read_only=True)
+                driver._current_slots = [{"slot_index": "0-0", "present": True}]
+                driver._update_spool_location = AsyncMock()
+                with patch.object(DRIVER_MODULE.threading, "Thread") as mqtt_thread:
+                    await driver.send_filament_to_tray(0, 0, data, spool_id=explicit_id)
+                    mqtt_thread.assert_not_called()
+                driver._update_spool_location.assert_awaited_once_with(42, 0, 0)
+                self.assertEqual(driver._slot_spool_ids["0-0"], 42)
+                self.assertEqual(events[-1]["slots"][0]["spool_id"], 42)
+                # A later non-RFID MQTT snapshot must retain the manual mapping.
+                driver._process_slots({"print": {"ams": {"ams": [{
+                    "id": "0", "tray": [{"id": "0", "tray_type": "PLA",
+                                           "tray_color": "FF0000FF"}],
+                }]}}})
+                self.assertEqual(driver._current_slots[0]["spool_id"], 42)
+
     async def test_read_only_blocks_direct_setting(self):
         driver, _ = make_driver(read_only=True)
         driver._printer = object()

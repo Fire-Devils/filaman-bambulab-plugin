@@ -428,6 +428,8 @@ class SlotSupportMixin:
             elif not slot.get("present") and slot_index in self._slot_spool_ids:
                 slot["spool_id"] = None
                 self._slot_spool_ids.pop(slot_index, None)
+            elif slot.get("present") and slot_index in self._slot_spool_ids:
+                slot["spool_id"] = self._slot_spool_ids[slot_index]
 
             if (
                 previous is not None

@@ -46,6 +46,9 @@ jobs:
       - name: Test release notes generator
         run: python -m unittest discover -s tests -p 'test_release_notes.py' -v
 
+      - name: Test development versioning
+        run: python -m unittest discover -s tests -p 'test_dev_version.py' -v
+
   release:
     if: github.event_name != 'pull_request'
     needs: validate
@@ -87,6 +90,16 @@ jobs:
 
             echo "📦 Erstelle $ZIP_NAME ..."
             zip -r "$ZIP_NAME" "$FOLDER_NAME" -x "$FOLDER_NAME/__pycache__/*" "$FOLDER_NAME/*.pyc"
+
+            # Development iterations are prereleases and never stable releases.
+            if [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+-dev\.[1-9][0-9]*$ ]]; then
+              gh release create "$TAG" "$ZIP_NAME" \
+                --target "$GITHUB_SHA" \
+                --title "$FOLDER_NAME $VERSION (development)" \
+                --notes "Development build $VERSION from commit $GITHUB_SHA. Intended for testing; not a stable release." \
+                --prerelease --latest=false
+              continue
+            fi
 
             # Release-Notes aus Conventional Commits zusammenbauen und den
             # Versionssprung gegen die Änderungen seit dem letzten Tag prüfen.
