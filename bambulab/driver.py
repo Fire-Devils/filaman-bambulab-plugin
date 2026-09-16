@@ -335,20 +335,25 @@ class Driver(
             self._printer.mqtt_start()
             logger.info(f"Bambu driver reconnected for printer {self.printer_id}")
 
-    def send_filament_to_tray(
-        self, ams_id: int, tray_id: int, filament_data: dict
+    async def send_filament_to_tray(
+        self, ams_id: int, tray_id: int, filament_data: dict,
+        spool_id: int | None = None,
     ) -> None:
-        """Filament-Setting direkt an einen bestimmten Tray senden (ohne Pending-Mechanismus)."""
-        dispatched = self._send_filament_setting(ams_id, tray_id, filament_data)
-
-        # Location nach erfolgreichem Direkt-Assignment aktualisieren
-        filaman_spool_id = filament_data.get("filaman_spool_id")
-        if dispatched and filaman_spool_id and self._loop:
-            self._loop.call_soon_threadsafe(
-                lambda: asyncio.create_task(
-                    self._update_spool_location(filaman_spool_id, ams_id, tray_id)
-                )
-            )
+        """Assign a FilaMan spool directly; read-only suppresses only MQTT writes."""
+        filaman_spool_id = spool_id or filament_data.get("filaman_spool_id") or filament_data.get("id")
+        if filaman_spool_id:
+            filaman_spool_id = int(filaman_spool_id)
+            slot_index = f"{ams_id}-{tray_id}"
+            await self._update_spool_location(filaman_spool_id, ams_id, tray_id)
+            self._slot_spool_ids[slot_index] = filaman_spool_id
+            for slot in self._current_slots:
+                if slot.get("slot_index") == slot_index:
+                    slot["spool_id"] = filaman_spool_id
+                    tray_uuid = self._normalize_hex_identifier(slot.get("tray_uuid"), 32)
+                    if tray_uuid:
+                        self._spool_ids_by_tray_uuid[tray_uuid] = filaman_spool_id
+            self._emit_slots_with_spool_ids()
+        self._send_filament_setting(ams_id, tray_id, filament_data)
 
     # -- Pending-Spool API ----------------------------------------------------
 

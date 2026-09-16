@@ -194,6 +194,44 @@ exact SemVer transition: `fix` and maintenance changes require a patch release,
 The pure-Python generator and its tests live in `scripts/generate_release_notes.py`
 and `tests/test_release_notes.py`.
 
+## Development Versions
+
+Use development versions for test ZIPs instead of publishing a stable patch for
+each iteration. The version is stored in `bambulab/plugin.json` and included in
+the installed ZIP. Run these commands from the repository root:
+
+```sh
+# From stable 2.8.0: start 2.8.1-dev.1 (bug fixes).
+# From a dev version: increment only dev.N.
+python3 scripts/dev_version.py
+
+# From a stable version: start the next feature or breaking-change cycle.
+python3 scripts/dev_version.py --bump minor
+python3 scripts/dev_version.py --bump major
+
+# Only when ready: turn 2.8.1-dev.N into stable 2.8.1.
+python3 scripts/dev_version.py --finalize
+```
+
+Choose the target using SemVer: patch for compatible fixes, minor for compatible
+features, major for breaking changes. An existing dev cycle rejects `--bump` to
+avoid accidentally advancing its stable target on every iteration. The script
+only edits the manifest; it does not commit, push, tag or publish. Commit the
+version with a message such as `chore: bump plugin version to 2.8.1-dev.2`.
+
+On main pushes or manual runs, the release workflow publishes `-dev.N` versions
+as GitHub **prereleases**, never as the latest stable release. Re-running the same
+version skips an existing release. Increase the dev counter for a new test ZIP.
+Pull requests run validation only and publish nothing. Before submitting an
+upstream PR, align the manifest version with the maintainer's requested version;
+dev numbering does not require upstream to adopt the fork's stable numbering.
+Stable releases continue through the existing Conventional Commit validation,
+which ignores dev tags when selecting the previous stable release.
+
+Historical stable fork tags still exist: dev numbering does not erase or reuse
+them. Coordinate the eventual stable release with upstream, particularly when
+that version already has a release in this fork.
+
 ## AI-Assisted Development
 
 This plugin has been developed with the assistance of generative AI tools, including OpenAI Codex. AI assistance has been used for parts of the implementation, refactoring, testing, debugging and documentation. The project is not presented as exclusively human-written; its human maintainers remain responsible for reviewing, accepting and publishing all changes.
