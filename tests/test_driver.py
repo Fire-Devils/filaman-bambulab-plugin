@@ -3,6 +3,7 @@ import asyncio
 import json
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
 from sqlalchemy import func, select
@@ -302,6 +303,9 @@ class ModuleLayoutTests(unittest.TestCase):
         self.assertEqual(
             Driver._register_inventory_enrichment.__module__,
             "bambulab.catalog_enrichment",
+        )
+        self.assertEqual(
+            Driver.get_display_state.__module__, "bambulab.display"
         )
 
 
@@ -2292,3 +2296,146 @@ class PrinterNameTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+X1C_PUSH_STATUS = {
+    "print": {
+        "command": "push_status",
+        "gcode_state": "RUNNING",
+        "subtask_name": "benchy.3mf",
+        "mc_percent": 42,
+        "mc_remaining_time": 62,
+        "layer_num": 57,
+        "total_layer_num": 130,
+        "nozzle_temper": 219.6,
+        "nozzle_target_temper": 220,
+        "bed_temper": 60.0,
+        "chamber_temper": 31.5,
+        "spd_lvl": 2,
+        "ams": {
+            "tray_now": 4,
+            "ams": [
+                {
+                    "id": "0",
+                    "temp": "24.4",
+                    "humidity": "3",
+                    "humidity_raw": "6",
+                    "tray": [{"id": "0", "tray_type": "PLA", "tray_color": "FF0000FF"}],
+                },
+                {
+                    "id": "128",
+                    "temp": "40.0",
+                    "humidity": "1",
+                    "dry_status": 2,
+                    "dry_time": 120,
+                    "dry_target_temp": 65,
+                    "tray": [{"id": "0", "tray_type": "PA"}],
+                },
+            ],
+        },
+        "vt_tray": [{"id": "254"}],
+    }
+}
+
+
+class DisplayStateTests(unittest.IsolatedAsyncioTestCase):
+    """The snapshot FilaMan's AMS View reads through get_display_state()."""
+
+    async def test_push_status_fills_the_snapshot(self):
+        driver, _ = make_driver(printer_model="X1C")
+        driver._connected = True
+        driver._update_display_state(X1C_PUSH_STATUS)
+
+        state = await driver.get_display_state()
+        self.assertTrue(state["connected"])
+        self.assertEqual(state["gcode_state"], "RUNNING")
+        self.assertEqual(state["nozzle_temper"], 219.6)
+        self.assertEqual(state["bed_temper"], 60.0)
+        self.assertEqual(state["mc_percent"], 42)
+        self.assertEqual(state["ams"]["tray_now"], 4)
+        self.assertEqual(state["vt_tray"], [{"id": "254"}])
+        unit = state["ams"]["ams"][0]
+        self.assertEqual(unit["temp"], "24.4")
+
+    async def test_humidity_and_humidity_raw_stay_apart(self):
+        """FilaMan decides which of the two means percent; folding them loses that."""
+        driver, _ = make_driver(printer_model="X1C")
+        driver._update_display_state(X1C_PUSH_STATUS)
+
+        unit = (await driver.get_display_state())["ams"]["ams"][0]
+        self.assertEqual(unit["humidity"], "3")
+        self.assertEqual(unit["humidity_raw"], "6")
+
+    async def test_drying_figures_reach_the_snapshot(self):
+        driver, _ = make_driver(printer_model="X1C")
+        driver._update_display_state(X1C_PUSH_STATUS)
+
+        ht = (await driver.get_display_state())["ams"]["ams"][1]
+        self.assertEqual(ht["dry_status"], 2)
+        self.assertEqual(ht["dry_time"], 120)
+        self.assertEqual(ht["dry_target_temp"], 65)
+
+    async def test_a_light_message_does_not_wipe_the_climate(self):
+        """Bambu sends partial reports; a tray_now-only message must not blank the units."""
+        driver, _ = make_driver(printer_model="X1C")
+        driver._update_display_state(X1C_PUSH_STATUS)
+        driver._update_display_state(
+            {"print": {"command": "push_status", "ams": {"tray_now": 255}}}
+        )
+
+        state = await driver.get_display_state()
+        self.assertEqual(state["ams"]["tray_now"], 255)
+        self.assertEqual(state["ams"]["ams"][0]["temp"], "24.4")
+        self.assertEqual(state["ams"]["ams"][0]["humidity_raw"], "6")
+
+    async def test_a_unit_reported_without_climate_keeps_its_last_reading(self):
+        driver, _ = make_driver(printer_model="X1C")
+        driver._update_display_state(X1C_PUSH_STATUS)
+        driver._update_display_state(
+            {
+                "print": {
+                    "command": "push_status",
+                    "ams": {"ams": [{"id": "0", "tray": [{"id": "0", "tray_type": "PETG"}]}]},
+                }
+            }
+        )
+
+        unit = (await driver.get_display_state())["ams"]["ams"][0]
+        self.assertEqual(unit["temp"], "24.4")
+        self.assertEqual(unit["tray"][0]["tray_type"], "PETG")
+
+    async def test_temperature_only_message_is_not_dropped(self):
+        """_process_slots skips these, so the snapshot has to be fed before it."""
+        driver, _ = make_driver(printer_model="X1C")
+        driver._on_message(
+            None,
+            None,
+            None,
+            SimpleNamespace(
+                topic="device/X/report",
+                payload=json.dumps(
+                    {"print": {"command": "push_status", "nozzle_temper": 215.0, "bed_temper": 55.0}}
+                ).encode(),
+            ),
+        )
+
+        state = await driver.get_display_state()
+        self.assertEqual(state["nozzle_temper"], 215.0)
+        self.assertEqual(state["bed_temper"], 55.0)
+
+    async def test_no_report_yet_still_answers_with_the_connection(self):
+        driver, _ = make_driver(printer_model="X1C")
+        driver._connected = False
+
+        self.assertEqual(await driver.get_display_state(), {"connected": False})
+
+    async def test_a_disconnect_keeps_the_last_known_values(self):
+        """The board shows the last state and says the printer is offline."""
+        driver, _ = make_driver(printer_model="X1C")
+        driver._connected = True
+        driver._update_display_state(X1C_PUSH_STATUS)
+        driver._on_disconnect(None, None, None, None, None, None)
+
+        state = await driver.get_display_state()
+        self.assertFalse(state["connected"])
+        self.assertEqual(state["ams"]["ams"][0]["temp"], "24.4")
