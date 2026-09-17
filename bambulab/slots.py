@@ -277,6 +277,10 @@ class SlotSupportMixin:
 
         # AMS-Einheiten Metadaten — nur aktualisieren wenn AMS-Daten vorhanden
         if ams_data:
+            previous_info = {
+                unit.get("ams_id"): unit.get("info")
+                for unit in self._current_ams_units
+            }
             ams_units: list[dict[str, Any]] = []
             for ams_unit in ams_data:
                 ams_id = int(ams_unit.get("id", 0))
@@ -289,6 +293,10 @@ class SlotSupportMixin:
                         "temp": ams_unit.get("temp"),
                         "tray_count": len(ams_unit.get("tray", [])),
                         "serial": self._ams_serials.get(str(ams_id), None),
+                        # Raw hex flags; bits 0-3 say which unit this is (AMS,
+                        # AMS Lite, AMS 2 Pro, AMS HT). FilaMan's AMS View reads
+                        # the model from here. Kept when a message leaves it out.
+                        "info": ams_unit.get("info") or previous_info.get(ams_id),
                     }
                 )
             self._current_ams_units = ams_units
