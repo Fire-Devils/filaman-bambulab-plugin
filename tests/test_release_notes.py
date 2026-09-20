@@ -8,8 +8,10 @@ from scripts.generate_release_notes import (
     ReleaseNotesError,
     Version,
     build_release_notes,
+    expected_version,
     parse_conventional_commit,
     relevant_commits,
+    required_bump,
     validate_version,
 )
 
@@ -57,6 +59,27 @@ class ConventionalCommitTests(unittest.TestCase):
 
         self.assertEqual([item.description for item in commits], ["reuse an existing spool"])
 
+    def test_ignores_manually_worded_version_commits(self):
+        commits = relevant_commits(
+            [
+                git_commit("fix(plugin): update version to 2.8.2 in plugin manifest"),
+                git_commit("fix(plugin): revert version to 2.8.1 in plugin manifest"),
+                git_commit("fix(plugin): update plugin version to 2.7.4 in manifest"),
+                git_commit("chore: set the version to 2.9.0"),
+                git_commit("fix: reuse an existing spool"),
+            ]
+        )
+
+        self.assertEqual([item.description for item in commits], ["reuse an existing spool"])
+
+    def test_keeps_features_that_only_mention_a_version(self):
+        commits = relevant_commits(
+            [git_commit("feat(plugin): update version to the payload")]
+        )
+
+        self.assertEqual(len(commits), 1)
+        self.assertEqual(commits[0].commit_type, "feat")
+
     def test_rejects_nonconventional_direct_commit(self):
         with self.assertRaisesRegex(ReleaseNotesError, "not a Conventional Commit"):
             relevant_commits([git_commit("Update driver")])
@@ -95,6 +118,20 @@ class SemanticVersionTests(unittest.TestCase):
         )
 
         self.assertEqual(bump, "major")
+
+    def test_derives_minor_bump_for_a_feature_after_a_bump_commit(self):
+        commits = relevant_commits(
+            [
+                git_commit("chore: bump plugin version to 2.8.2"),
+                git_commit("feat: hand each AMS unit's info flags to FilaMan"),
+            ]
+        )
+        bump = required_bump(commits)
+
+        self.assertEqual(bump, "minor")
+        self.assertEqual(
+            str(expected_version(Version.parse("2.8.1"), bump)), "2.9.0"
+        )
 
     def test_rejects_incorrect_manifest_version(self):
         with self.assertRaisesRegex(ReleaseNotesError, "expected 2.9.0"):

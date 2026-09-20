@@ -27,8 +27,10 @@ BREAKING_FOOTER_RE = re.compile(
     r"(?im)^BREAKING(?: |-)?CHANGE:\s*(?P<description>.+)$"
 )
 VERSION_BUMP_RE = re.compile(
-    r"^bump (?:the )?(?:plugin )?version to\b", re.IGNORECASE
+    r"^(?:bump|update|revert|set) (?:the )?(?:plugin )?version (?:to|in)\b",
+    re.IGNORECASE,
 )
+VERSION_BUMP_TYPES = frozenset({"chore", "fix"})
 
 CATEGORY_ORDER = (
     "Breaking Changes",
@@ -142,7 +144,7 @@ def parse_conventional_commit(commit: GitCommit) -> ConventionalCommit | None:
 
     commit_type = match.group("type")
     description = match.group("description").strip()
-    if commit_type == "chore" and VERSION_BUMP_RE.match(description):
+    if commit_type in VERSION_BUMP_TYPES and VERSION_BUMP_RE.match(description):
         return None
 
     footer = BREAKING_FOOTER_RE.search(commit.body or "")
@@ -202,8 +204,10 @@ def load_commits(
     return parse_git_log(_run_git(arguments, repository))
 
 
-def find_previous_tag(repository: Path, plugin: str, version: Version) -> str | None:
-    """Return the highest stable plugin tag whose version precedes ``version``."""
+def find_previous_tag(
+    repository: Path, plugin: str, version: Version | None = None
+) -> str | None:
+    """Return the highest stable plugin tag below ``version``, or the latest one."""
     prefix = f"{plugin}-v"
     candidates: list[tuple[Version, str]] = []
     for tag in _run_git(["tag", "--list", f"{prefix}*"], repository).splitlines():
@@ -212,7 +216,7 @@ def find_previous_tag(repository: Path, plugin: str, version: Version) -> str | 
             parsed = Version.parse(value)
         except ReleaseNotesError:
             continue
-        if parsed < version:
+        if version is None or parsed < version:
             candidates.append((parsed, tag))
     return max(candidates)[1] if candidates else None
 
@@ -328,23 +332,55 @@ def build_parser() -> argparse.ArgumentParser:
     """Create the command-line interface used locally and by GitHub Actions."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--plugin", required=True, help="Plugin/tag prefix")
-    parser.add_argument("--version", required=True, help="Manifest version")
+    parser.add_argument("--version", help="Manifest version")
     parser.add_argument("--target", default="HEAD", help="Release target revision")
     parser.add_argument("--previous-tag", help="Override previous tag discovery")
     parser.add_argument("--repository", type=Path, default=Path.cwd())
     parser.add_argument("--repository-url", default="")
     parser.add_argument("--description", default="")
     parser.add_argument("--path", action="append", default=[])
-    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--output", type=Path)
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help="Print the required bump and expected version, write nothing",
+    )
     return parser
+
+
+def check_next_version(
+    repository: Path, plugin: str, target: str, paths: Sequence[str],
+    previous_tag: str | None = None,
+) -> tuple[str, str, Version]:
+    """Derive the bump the commits since the latest stable tag demand."""
+    previous_tag = previous_tag or find_previous_tag(repository, plugin)
+    if not previous_tag:
+        raise ReleaseNotesError(f"No stable {plugin} tag found in this repository")
+    previous_version = Version.parse(previous_tag.removeprefix(f"{plugin}-v"))
+    commits = relevant_commits(load_commits(repository, previous_tag, target, paths))
+    bump = required_bump(commits)
+    return bump, previous_tag, expected_version(previous_version, bump)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     """Generate notes, returning a nonzero status with a concise error message."""
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if not args.check:
+        if not args.version:
+            parser.error("--version is required unless --check is used")
+        if not args.output:
+            parser.error("--output is required unless --check is used")
     try:
-        version = Version.parse(args.version)
         repository = args.repository.resolve()
+        if args.check:
+            bump, previous_tag, expected = check_next_version(
+                repository, args.plugin, args.target, args.path, args.previous_tag
+            )
+            print(f"{bump} {expected}")
+            print(f"Commits since {previous_tag} require a {bump} bump", file=sys.stderr)
+            return 0
+        version = Version.parse(args.version)
         previous_tag = args.previous_tag or find_previous_tag(
             repository, args.plugin, version
         )
