@@ -377,7 +377,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             bump, previous_tag, expected = check_next_version(
                 repository, args.plugin, args.target, args.path, args.previous_tag
             )
-            print(f"{bump} {expected}")
+            print(f"{bump} {expected} {previous_tag}")
             print(f"Commits since {previous_tag} require a {bump} bump", file=sys.stderr)
             return 0
         version = Version.parse(args.version)
