@@ -1,6 +1,9 @@
 """Unit tests for Conventional Commit release-note generation."""
 
+import subprocess
+import tempfile
 import unittest
+from pathlib import Path
 
 from scripts.generate_release_notes import (
     ConventionalCommit,
@@ -8,6 +11,7 @@ from scripts.generate_release_notes import (
     ReleaseNotesError,
     Version,
     build_release_notes,
+    check_next_version,
     expected_version,
     parse_conventional_commit,
     relevant_commits,
@@ -140,6 +144,41 @@ class SemanticVersionTests(unittest.TestCase):
                 Version.parse("2.8.1"),
                 [self.parsed("feat: add another option")],
             )
+
+
+class CheckNextVersionTests(unittest.TestCase):
+    @staticmethod
+    def git(repository: Path, *arguments: str) -> None:
+        """Run one Git command inside the throwaway fixture repository."""
+        subprocess.run(
+            ["git", *arguments], cwd=repository, check=True, capture_output=True
+        )
+
+    def test_reports_bump_previous_tag_and_expected_version(self):
+        with tempfile.TemporaryDirectory() as folder:
+            repository = Path(folder)
+            self.git(repository, "init", "--quiet")
+            self.git(repository, "config", "user.email", "test@example.com")
+            self.git(repository, "config", "user.name", "Release Test")
+            plugin = repository / "bambulab"
+            plugin.mkdir()
+            (plugin / "plugin.json").write_text('{"version": "2.8.1"}\n')
+            self.git(repository, "add", "--all")
+            self.git(repository, "commit", "--quiet", "-m", "fix: keep the manifest")
+            self.git(repository, "tag", "bambulab-v2.8.1")
+            (plugin / "slots.py").write_text("FLAGS = 1\n")
+            self.git(repository, "add", "--all")
+            self.git(
+                repository, "commit", "--quiet", "-m", "feat: report the AMS info flags"
+            )
+
+            bump, previous_tag, expected = check_next_version(
+                repository, "bambulab", "HEAD", ["bambulab"]
+            )
+
+        self.assertEqual(bump, "minor")
+        self.assertEqual(previous_tag, "bambulab-v2.8.1")
+        self.assertEqual(str(expected), "2.9.0")
 
 
 class MarkdownTests(unittest.TestCase):
