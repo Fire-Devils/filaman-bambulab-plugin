@@ -732,6 +732,43 @@ class SlotProcessingTests(unittest.TestCase):
         self.assertEqual(ams_info["slot_count"], 3)
         self.assertTrue(ams_info["external_spool"])
 
+    def test_health_reports_the_ams_info_flags_of_each_unit(self):
+        driver, _ = make_driver(auto_import_spools=False)
+        driver._process_slots(
+            {
+                "print": {
+                    "ams": {
+                        "ams": [
+                            {"id": "0", "info": "1003", "tray": [{"id": "0", "tray_type": "PLA"}]},
+                            {"id": "128", "info": "1004", "tray": [{"id": "0", "tray_type": "PA"}]},
+                        ]
+                    }
+                }
+            }
+        )
+        self.assertEqual(
+            [(unit["ams_id"], unit["info"]) for unit in driver.health()["ams_units"]],
+            [(0, "1003"), (128, "1004")],
+        )
+
+        # A later report without the flags must not forget them.
+        driver._process_slots(
+            {
+                "print": {
+                    "ams": {
+                        "ams": [
+                            {"id": "0", "humidity": "3", "tray": [{"id": "0", "tray_type": "PLA"}]},
+                            {"id": "128", "tray": [{"id": "0", "tray_type": "PA"}]},
+                        ]
+                    }
+                }
+            }
+        )
+        self.assertEqual(
+            [unit["info"] for unit in driver.health()["ams_units"]],
+            ["1003", "1004"],
+        )
+
     def test_empty_vir_slot_list_falls_back_to_vt_tray(self):
         driver, _ = make_driver(auto_import_spools=False)
         driver._process_slots(
