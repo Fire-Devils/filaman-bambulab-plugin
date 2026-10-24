@@ -587,6 +587,38 @@ class SlotProcessingTests(unittest.TestCase):
 
         self.assertEqual(released, ["0-0"])
 
+    def test_empty_tray_emits_null_with_or_without_cached_identity(self):
+        """A cold driver and a stale RFID cache must both clear the core link."""
+        uuid = "A" * 32
+        for cached in (False, True):
+            with self.subTest(cached=cached):
+                driver, _ = make_driver()
+                driver._loop = Mock()
+                if cached:
+                    driver._slot_spool_ids["0-0"] = 42
+                    driver._spool_ids_by_tray_uuid[uuid] = 42
+                driver._process_slots({"print": {"ams": {"ams": [{
+                    "id": "0", "tray": [{"id": "0", "tray_type": "", "tray_uuid": uuid}],
+                }]}}})
+                payload = driver._loop.call_soon_threadsafe.call_args.args[1]
+                self.assertIsNone(payload["slots"][0]["spool_id"])
+                self.assertNotIn("0-0", driver._slot_spool_ids)
+
+    def test_reemit_clears_empty_slot_but_keeps_manual_non_bambu_assignment(self):
+        """Re-emission must not restore a cached RFID ID on an empty slot."""
+        driver, events = make_driver()
+        uuid = "A" * 32
+        driver._spool_ids_by_tray_uuid[uuid] = 42
+        driver._slot_spool_ids = {"0-0": 42, "0-1": 99}
+        driver._current_slots = [
+            {"slot_index": "0-0", "present": False, "tray_uuid": uuid, "spool_id": 42},
+            {"slot_index": "0-1", "present": True, "tray_uuid": "0" * 32, "spool_id": 99},
+        ]
+        driver._emit_slots_with_spool_ids()
+        self.assertIsNone(events[-1]["slots"][0]["spool_id"])
+        self.assertEqual(events[-1]["slots"][1]["spool_id"], 99)
+        self.assertEqual(driver._slot_spool_ids, {"0-1": 99})
+
     def test_a_tray_that_stays_empty_is_not_released_again(self):
         """Otherwise every poll of an empty AMS hits the database."""
         driver, _ = make_driver(auto_import_spools=False)

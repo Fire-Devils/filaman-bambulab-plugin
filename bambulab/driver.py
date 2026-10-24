@@ -186,11 +186,16 @@ class Driver(
         updated_slots: list[dict[str, Any]] = []
         for current in self._current_slots:
             slot = dict(current)
+            slot_index = str(slot.get("slot_index") or "")
             tray_uuid = self._normalize_hex_identifier(slot.get("tray_uuid"), 32)
-            if tray_uuid and tray_uuid in self._spool_ids_by_tray_uuid:
+            if not slot.get("present"):
+                # FilaMan clears persisted assignments only for an explicit null.
+                slot["spool_id"] = None
+                self._slot_spool_ids.pop(slot_index, None)
+            elif tray_uuid and tray_uuid in self._spool_ids_by_tray_uuid:
                 spool_id = self._spool_ids_by_tray_uuid[tray_uuid]
                 slot["spool_id"] = spool_id
-                self._slot_spool_ids[str(slot.get("slot_index") or "")] = spool_id
+                self._slot_spool_ids[slot_index] = spool_id
             updated_slots.append(slot)
         self._current_slots = updated_slots
         self.emit(
