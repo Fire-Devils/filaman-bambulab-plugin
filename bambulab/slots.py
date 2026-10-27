@@ -429,14 +429,15 @@ class SlotSupportMixin:
                 slot["spool_id"] = None
 
             known_spool_id: int | None = None
-            if tray_uuid and tray_uuid in self._spool_ids_by_tray_uuid:
+            if not slot.get("present"):
+                # Empty state wins over RFID caches, including after a restart.
+                slot["spool_id"] = None
+                self._slot_spool_ids.pop(slot_index, None)
+            elif tray_uuid and tray_uuid in self._spool_ids_by_tray_uuid:
                 known_spool_id = self._spool_ids_by_tray_uuid[tray_uuid]
                 slot["spool_id"] = known_spool_id
                 self._slot_spool_ids[slot_index] = known_spool_id
-            elif not slot.get("present") and slot_index in self._slot_spool_ids:
-                slot["spool_id"] = None
-                self._slot_spool_ids.pop(slot_index, None)
-            elif slot.get("present") and slot_index in self._slot_spool_ids:
+            elif slot_index in self._slot_spool_ids:
                 slot["spool_id"] = self._slot_spool_ids[slot_index]
 
             if (
