@@ -142,7 +142,9 @@ The plugin manifest also defines the printer-specific parameters
 `bambu_nozzle_temp_min`, `bambu_nozzle_temp_max` and
 `bambu_max_volumetric_speed` for both filament and spool overrides.
 `bambu_idx`, `bambu_tray_idx` and the nozzle-temperature parameters participate
-directly in current matching or tray assignment. The remaining calibration and
+directly in current matching or tray assignment. When FilaMan supplies a saved
+`bambu_setting_id` as `setting_id`, the driver includes it in the tray assignment
+command so the printer receives the selected preset ID. The remaining calibration and
 profile parameters are retained for compatibility with existing FilaMan,
 Spoolman and original-plugin workflows. They should not be removed without a
 dedicated data migration and a compatibility review.
