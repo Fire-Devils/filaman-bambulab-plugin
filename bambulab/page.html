@@ -3,11 +3,16 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="stylesheet" href="/plugin-fonts.css">
   <link rel="icon" type="image/png" href="/favicon.png">
   <title>Spool overview · FilaMan</title>
   <script>
     (() => {
-      document.documentElement.dataset.theme = localStorage.getItem('theme') || 'brand';
+      const applyTheme = () => { document.documentElement.dataset.theme = localStorage.getItem('theme') || 'brand'; };
+      applyTheme();
+      window.addEventListener('storage', (event) => {
+        if (event.key === 'theme' || event.key === null) applyTheme();
+      });
       const language = (localStorage.getItem('lang') || navigator.language || 'en').toLowerCase().split('-')[0];
       document.documentElement.lang = language === 'de' ? 'de' : 'en';
     })();
@@ -193,11 +198,14 @@
     .spool-art::before, .spool-art::after { position: absolute; top: 50%; width: 22px; height: 50px; border-radius: 10px; background: var(--surface-muted); content: ""; transform: translateY(-50%); }
     .spool-art::before { left: 15px; }
     .spool-art::after { right: 15px; }
+    .spool-reel-full { display:block; width:160px; height:160px; }
+    .spool-reel-full svg { display:block; width:100%; height:100%; }
     .empty .spool-art { filter: grayscale(1); opacity: .28; }
 
     .slot-body { padding: 16px 17px 18px; }
     .slot-kicker { display: flex; align-items: center; justify-content: space-between; gap: 10px; color: var(--muted); font-size: 11px; font-weight: 800; letter-spacing: .06em; text-transform: uppercase; }
-    .color-chip { width: 13px; height: 13px; flex: 0 0 auto; border: 1px solid rgba(0,0,0,.18); border-radius: 50%; background: var(--chip); box-shadow: 0 0 0 3px color-mix(in srgb, var(--chip) 20%, transparent); }
+    .slot-kicker > span:first-child { min-width: 0; overflow-wrap: anywhere; }
+    .color-pill { display: block; width: 92px; height: 22px; flex: 0 0 auto; border: 1px solid var(--border); border-radius: 999px; background: var(--surface-muted); }
     .slot-name { margin: 7px 0 2px; font-size: 18px; line-height: 1.25; letter-spacing: -.02em; }
     .slot-subtitle { min-height: 21px; margin: 0; color: var(--muted); font-size: 13px; }
     .slot-link { display: inline-block; max-width: 100%; color: inherit; text-decoration: none; }
@@ -281,11 +289,13 @@
         </nav>
         <section id="summary" class="summary" aria-label="Summary" data-i18n-aria="page.summary"></section>
         <section id="content"><div class="notice" data-i18n="loading.printers">Loading Bambu printers…</div></section>
-        <p class="footer-note" data-i18n="page.footer">Catalog images belong to the shared filament and are reused by all matching spools. Bambu Lab is the first image provider; more manufacturers can be added later.</p>
+        <p class="footer-note" data-i18n="page.footer">Bambu store images belong to the shared filament and are reused by matching spools. Image lookup stores URLs; existing images remain available when lookup is off.</p>
   </main>
 
   <script>
-    (() => {
+    (async () => {
+      let renderSpoolReel = null;
+      let buildFilamentSwatchStyle = null;
       const translations = {
         en: {
           'app.subtitle': 'Filament Management',
@@ -298,7 +308,7 @@
           'page.title': 'Spool overview', 'page.lead': 'All FilaMan spools in one gallery, plus live status for Bambu AMS systems.',
           'page.managePrinters': 'Manage printers', 'page.selectPrinter': 'Select printer', 'page.allPrinters': 'All Bambu printers',
           'page.selectView': 'Select view', 'page.amsLive': 'AMS live', 'page.allSpools': 'All spools', 'page.summary': 'Summary',
-          'page.footer': 'Catalog images belong to the shared filament and are reused by all matching spools. Bambu Lab is the first image provider; more manufacturers can be added later.',
+          'page.footer': 'Bambu store images belong to the shared filament and are reused by matching spools. Image lookup stores URLs; existing images remain available when lookup is off.',
           'loading.printers': 'Loading Bambu printers…', 'loading.spools': 'Loading spools…',
           'error.login': 'Please sign in to FilaMan first.', 'error.ams': 'The AMS data could not be loaded.', 'error.spools': 'The spools could not be loaded.',
           'slot.emptyAria': 'Empty AMS slot', 'slot.spoolAria': 'Filament spool', 'slot.unknownFilament': 'Unknown filament',
@@ -311,7 +321,7 @@
           'ams.catalogImages': 'Catalog images', 'ams.imagesResolved': 'resolved & cached', 'ams.noPrinter': 'No Bambu printer found',
           'ams.noPrinterHelp': 'First create an active printer with the Bambu Lab driver.', 'ams.readOnly': 'Read-only',
           'ams.mqttControl': 'MQTT control', 'ams.autoImport': 'Auto import', 'ams.autoImportOff': 'Auto import off',
-          'ams.imagesOn': 'Catalog images on', 'ams.imagesOff': 'Catalog images off', 'ams.connected': 'connected', 'ams.offline': 'offline',
+          'ams.imagesOn': 'Bambu image lookup: On', 'ams.imagesOff': 'Bambu image lookup: Off', 'ams.connected': 'connected', 'ams.offline': 'offline',
           'ams.noSlotData': 'No AMS slot data received yet.',
           'inventory.unknownManufacturer': 'Unknown manufacturer', 'inventory.spoolNumber': 'Spool #{id}', 'inventory.noColor': 'No color name',
           'inventory.total': 'Total spools', 'inventory.withArchived': 'including archived', 'inventory.active': 'active spools',
@@ -347,7 +357,7 @@
           'ams.catalogImages': 'Katalogbilder', 'ams.imagesResolved': 'aufgelöst & gecacht', 'ams.noPrinter': 'Kein Bambu-Drucker gefunden',
           'ams.noPrinterHelp': 'Lege zuerst einen aktiven Drucker mit dem Bambu-Lab-Treiber an.', 'ams.readOnly': 'Nur lesen',
           'ams.mqttControl': 'MQTT-Steuerung', 'ams.autoImport': 'Auto-Import', 'ams.autoImportOff': 'Auto-Import aus',
-          'ams.imagesOn': 'Katalogbilder an', 'ams.imagesOff': 'Katalogbilder aus', 'ams.connected': 'verbunden', 'ams.offline': 'offline',
+          'ams.imagesOn': 'Bambu-Bildsuche: An', 'ams.imagesOff': 'Bambu-Bildsuche: Aus', 'ams.connected': 'verbunden', 'ams.offline': 'offline',
           'ams.noSlotData': 'Noch keine AMS-Slotdaten empfangen.',
           'inventory.unknownManufacturer': 'Unbekannter Hersteller', 'inventory.spoolNumber': 'Spule #{id}', 'inventory.noColor': 'Keine Farbbezeichnung',
           'inventory.total': 'Spulen gesamt', 'inventory.withArchived': 'inklusive archivierter', 'inventory.active': 'aktive Spulen',
@@ -416,11 +426,14 @@
       };
 
       const finiteNumber = (value) => {
+        if (value === null || value === undefined || value === '' || typeof value === 'boolean') return null;
         const parsed = Number(value);
         return Number.isFinite(parsed) ? parsed : null;
       };
 
       const clampPercent = (value) => value === null ? null : Math.max(0, Math.min(100, value));
+
+      const spoolRemainingWeight = (spool) => finiteNumber(spool?.metrics?.effective_remaining_weight_g === undefined ? spool?.remaining_weight_g : spool.metrics.effective_remaining_weight_g);
 
       const imageMetadata = (filament = {}) => {
         const fields = filament.custom_fields || {};
@@ -458,8 +471,24 @@
         return (aa[0] - bb[0]) || (aa[1] - bb[1]);
       };
 
-      const spoolFallback = (hex, empty = false) => `
-        <div class="spool-art" style="--filament:${escapeHtml(hex)}" aria-label="${escapeHtml(t(empty ? 'slot.emptyAria' : 'slot.spoolAria'))}"></div>`;
+      // Keep at most one gallery page plus a few AMS reels; paging cannot grow this indefinitely.
+      const reelCache = new Map();
+      const spoolFallback = (hex, empty = false, data = null, key = '') => {
+        if (renderSpoolReel) {
+          const reel = data || { fraction: empty ? 0 : null, colors: [hex], mode: 'striped' };
+          const fingerprint = JSON.stringify(reel);
+          const cached = key && reelCache.get(key);
+          if (cached?.fingerprint === fingerprint) return cached.html;
+          const html = renderSpoolReel(reel.fraction, reel.colors, reel.mode, { view: 'full' });
+          if (key) {
+            reelCache.set(key, { fingerprint, html });
+            if (reelCache.size > 64) reelCache.delete(reelCache.keys().next().value);
+          }
+          return html;
+        }
+        // Older core releases retain the original illustration.
+        return `<div class="spool-art" style="--filament:${escapeHtml(hex)}" aria-label="${escapeHtml(t(empty ? 'slot.emptyAria' : 'slot.spoolAria'))}"></div>`;
+      };
 
       const bindImageFallbacks = () => {
         content.querySelectorAll('.shop-image').forEach((image) => {
@@ -470,7 +499,7 @@
             image.remove();
             media.querySelector('.image-source')?.remove();
             media.querySelector('.provider-tag')?.remove();
-            media.insertAdjacentHTML('afterbegin', spoolFallback(hex));
+            media.insertAdjacentHTML('afterbegin', spoolFallback(hex, false, JSON.parse(media.dataset.reel || 'null'), media.dataset.reelKey));
           }, { once: true });
         });
       };
@@ -480,7 +509,14 @@
           <div class="metric"><span class="metric-label">${escapeHtml(label)}</span><strong class="metric-value">${escapeHtml(value)}</strong><span class="metric-detail">${escapeHtml(detail)}</span></div>`).join('');
       };
 
-      const renderSlot = (slot, spool) => {
+      const colorPill = (data, hex) => {
+        const style = buildFilamentSwatchStyle
+          ? buildFilamentSwatchStyle({ colors: data.colors.map(hex_code => ({ color: { hex_code } })), multi_color_style: data.mode })
+          : `background:${hex}`;
+        return `<span class="color-pill" style="${escapeHtml(style)}" aria-hidden="true"></span>`;
+      };
+
+      const renderSlot = (slot, spool, printerId) => {
         const present = Boolean(slot.present || slot.tray_type);
         const filament = spool?.filament || {};
         const catalog = imageMetadata(filament);
@@ -489,23 +525,26 @@
         const sourceUrl = safeHttpUrl(slot.shop_source_url) || catalog.sourceUrl;
         const spoolUrl = spool?.id ? `/spools/${encodeURIComponent(spool.id)}` : '';
         const remain = finiteNumber(slot.remain);
-        const remainingWeight = finiteNumber(spool?.remaining_weight_g);
+        const remainingWeight = spoolRemainingWeight(spool);
         const nominalWeight = finiteNumber(slot.tray_weight);
-        const displayPercent = remain !== null && remain >= 0 && remain <= 100 ? Math.round(remain) : null;
+        const nativePercent = spool?.metrics ? inventoryPercent(spool) : remain;
+        const displayPercent = nativePercent !== null && nativePercent >= 0 && nativePercent <= 100 ? Math.round(nativePercent) : null;
+        const reel = reelData(spool, slot);
+        const reelKey = `slot:${printerId}:${slot.slot_index}`;
         const title = filament.designation || slot.filament_name || slot.tray_sub_brands || slot.tray_type || t('slot.unknownFilament');
         const subtitle = filament.manufacturer_color_name || slot.manufacturer_color_name || t(present ? 'slot.notLinked' : 'slot.ready');
         const media = imageUrl
           ? `<img class="shop-image" src="${escapeHtml(imageUrl)}" alt="${escapeHtml(title)}" loading="lazy" decoding="async" referrerpolicy="no-referrer">`
-          : spoolFallback(hex, !present);
+          : spoolFallback(hex, !present, reel, reelKey);
 
         return `
           <article class="slot ${present ? '' : 'empty'}">
-            <div class="slot-media" data-fallback-color="${escapeHtml(hex)}">
+            <div class="slot-media" data-fallback-color="${escapeHtml(hex)}" data-reel="${escapeHtml(JSON.stringify(reel))}" data-reel-key="${escapeHtml(reelKey)}">
               ${media}
               ${imageUrl && sourceUrl ? `<a class="image-source" href="${escapeHtml(sourceUrl)}" target="_blank" rel="noopener noreferrer">${escapeHtml(t('slot.image', { provider: providerLabel(catalog.provider || 'bambulab') }))}</a>` : ''}
             </div>
             <div class="slot-body">
-              <div class="slot-kicker"><span>${escapeHtml(slot.slot_name || slot.slot_index || 'AMS Slot')}</span><i class="color-chip" style="--chip:${escapeHtml(hex)}"></i></div>
+              <div class="slot-kicker"><span>${escapeHtml(slot.slot_name || slot.slot_index || 'AMS Slot')}</span>${colorPill(reel, hex)}</div>
               <h3 class="slot-name">${spoolUrl ? `<a class="slot-link" href="${escapeHtml(spoolUrl)}">${escapeHtml(title)}</a>` : escapeHtml(title)}</h3>
               <p class="slot-subtitle">${escapeHtml(subtitle)}</p>
               ${present ? `
@@ -556,19 +595,32 @@
                 <div class="printer-title"><i class="status-dot ${health.connected ? 'online' : ''}"></i><div><h2>${escapeHtml(printer.name)}</h2><small>${escapeHtml(health.printer_model || 'Bambu Lab')} · ${escapeHtml(health.ams_type || 'AMS')} · ${escapeHtml(t(health.connected ? 'ams.connected' : 'ams.offline'))}</small></div></div>
                 <div class="badges">${badges}</div>
               </header>
-              <div class="slots">${slots.length ? slots.map((slot) => renderSlot(slot, spools.get(Number(slot.spool_id)))).join('') : `<div class="notice">${escapeHtml(t('ams.noSlotData'))}</div>`}</div>
+              <div class="slots">${slots.length ? slots.map((slot) => renderSlot(slot, spools.get(Number(slot.spool_id)), printer.id)).join('') : `<div class="notice">${escapeHtml(t('ams.noSlotData'))}</div>`}</div>
             </section>`;
         }).join('');
         bindImageFallbacks();
       };
 
       const inventoryPercent = (spool) => {
+        if (spool.metrics) return clampPercent(finiteNumber(spool.metrics.remaining_percent));
         const remaining = finiteNumber(spool.remaining_weight_g);
         const filamentWeight = finiteNumber(spool.filament?.raw_material_weight_g);
         const total = finiteNumber(spool.initial_total_weight_g);
         const empty = finiteNumber(spool.empty_spool_weight_g);
         const initialFilament = filamentWeight || (total !== null && empty !== null ? Math.max(0, total - empty) : null);
         return initialFilament && remaining !== null ? clampPercent((remaining / initialFilament) * 100) : null;
+      };
+
+      const reelData = (spool, slot = null) => {
+        const filament = spool?.filament || {};
+        const ordered = [...(filament.colors || [])].sort((a, b) => (a.position ?? 0) - (b.position ?? 0));
+        const colors = (filament.color_mode === 'single' ? ordered.slice(0, 1) : ordered)
+          .map((item) => item.color?.hex_code).filter((hex) => /^#?(?:[a-f0-9]{3,4}|[a-f0-9]{6}|[a-f0-9]{8})$/i.test(hex || ''));
+        if (!colors.length && /^(?:[a-f0-9]{6}|[a-f0-9]{8})$/i.test(slot?.tray_color || '')) colors.push(`#${slot.tray_color}`);
+        const present = slot ? Boolean(slot.present || slot.tray_type) : true;
+        const percent = spool ? inventoryPercent(spool) : finiteNumber(slot?.remain);
+        return { fraction: !present ? 0 : percent === null || percent < 0 || percent > 100 ? null : percent / 100,
+          colors, mode: filament.multi_color_style === 'gradient' ? 'gradient' : 'striped' };
       };
 
       const renderInventoryCard = (spool) => {
@@ -579,21 +631,23 @@
         const hex = colorHex(filament.colors?.[0]?.color?.hex_code);
         const catalog = imageMetadata(filament);
         const status = inventory.statuses.get(Number(spool.status_id));
-        const remaining = finiteNumber(spool.remaining_weight_g);
+        const remaining = spoolRemainingWeight(spool);
         const percent = inventoryPercent(spool);
+        const reel = reelData(spool);
+        const reelKey = `inventory:${spool.id}`;
         const hasRfid = Boolean(spool.rfid_uid || spool.custom_fields?.bambu_rfid_tag_1 || spool.custom_fields?.bambu_rfid_tag_2);
         const media = catalog.imageUrl
           ? `<img class="shop-image" src="${escapeHtml(catalog.imageUrl)}" alt="${escapeHtml(title)}" loading="lazy" decoding="async" referrerpolicy="no-referrer">`
-          : spoolFallback(hex);
+          : spoolFallback(hex, false, reel, reelKey);
         return `
           <article class="slot inventory-card">
-            <div class="slot-media" data-fallback-color="${escapeHtml(hex)}">
+            <div class="slot-media" data-fallback-color="${escapeHtml(hex)}" data-reel="${escapeHtml(JSON.stringify(reel))}" data-reel-key="${escapeHtml(reelKey)}">
               ${media}
               ${catalog.imageUrl ? `<span class="provider-tag">${escapeHtml(providerLabel(catalog.provider))}</span>` : ''}
               ${catalog.imageUrl && catalog.sourceUrl ? `<a class="image-source" href="${escapeHtml(catalog.sourceUrl)}" target="_blank" rel="noopener noreferrer">${escapeHtml(t('slot.source'))}</a>` : ''}
             </div>
             <div class="slot-body">
-              <div class="slot-kicker"><span>${escapeHtml(manufacturer)}</span><i class="color-chip" style="--chip:${escapeHtml(hex)}"></i></div>
+              <div class="slot-kicker"><span>${escapeHtml(manufacturer)}</span>${colorPill(reel, hex)}</div>
               <h3 class="slot-name"><a class="slot-link" href="/spools/${encodeURIComponent(spool.id)}">${escapeHtml(title)}</a></h3>
               <p class="slot-subtitle">${escapeHtml(colorName)}</p>
               <div class="weight-row"><strong>${remaining !== null ? `${Math.round(remaining)} g` : '—'}</strong><span>${percent !== null ? `${Math.round(percent)} %` : escapeHtml(t('slot.remaining'))}</span></div>
@@ -611,7 +665,7 @@
       const renderInventory = () => {
         const pageCount = Math.max(1, Math.ceil(inventory.total / inventory.pageSize));
         const imageCount = inventory.items.filter((spool) => imageMetadata(spool.filament).imageUrl).length;
-        const remainingTotal = inventory.items.reduce((sum, spool) => sum + (finiteNumber(spool.remaining_weight_g) || 0), 0);
+        const remainingTotal = inventory.items.reduce((sum, spool) => sum + (spoolRemainingWeight(spool) || 0), 0);
         const manufacturersWithSpools = inventory.manufacturers.filter((item) => (item.spool_count || 0) + (inventory.includeArchived ? item.archived_spool_count || 0 : 0) > 0);
         const materials = [...new Set(inventory.manufacturers.flatMap((item) => item.materials || []))].sort();
         renderMetrics([
@@ -693,7 +747,7 @@
             const health = await loadDriverHealth(printer.id, force);
             const spoolIds = [...new Set((health.slots || []).map((slot) => Number(slot.spool_id)).filter(Number.isFinite))];
             const spoolResults = await Promise.all(spoolIds.map(async (id) => {
-              try { return await requestJson(`/api/v1/spools/${encodeURIComponent(id)}`); }
+              try { return await requestJson(`/api/v1/spools/${encodeURIComponent(id)}?include_metrics=true`); }
               catch { return null; }
             }));
             return { printer, health, spools: new Map(spoolResults.filter(Boolean).map((spool) => [Number(spool.id), spool])) };
@@ -744,7 +798,7 @@
           await loadInventoryMetadata();
           const params = new URLSearchParams({
             page: String(inventory.page), page_size: String(inventory.pageSize),
-            sort_by: 'manufacturer', sort_order: 'asc',
+            sort_by: 'manufacturer', sort_order: 'asc', include_metrics: 'true',
           });
           if (inventory.search) params.set('search', inventory.search);
           if (inventory.manufacturerId) params.set('manufacturer_id', inventory.manufacturerId);
@@ -800,6 +854,8 @@
       viewTabs.forEach((tab) => tab.addEventListener('click', () => setView(tab.dataset.view)));
       refreshButton.addEventListener('click', () => activeView === 'ams' ? loadAms(true) : loadInventory(true));
       printerFilter.addEventListener('change', renderAms);
+      try { ({ renderSpoolReel, buildFilamentSwatchStyle } = await import('/spool-reel.js')); }
+      catch { /* Optional shared renderer: keep compatibility with older core releases. */ }
       initializeLanguage();
       setView(activeView, false);
       window.setInterval(() => { if (activeView === 'ams') loadAms(false); }, 20000);
