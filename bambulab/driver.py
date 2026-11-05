@@ -254,7 +254,7 @@ class Driver(
         self, ams_id: int, tray_id: int, filament_data: dict
     ) -> bool:
         """Filament-Setting an Drucker senden. Läuft in separatem Thread,
-        da set_filament_printer() blockierend ist (wait_for_publish)."""
+        da wait_for_publish() blockiert."""
         if self._read_only:
             logger.info(
                 f"Read-only mode: skipped filament setting for slot {ams_id}-{tray_id}"
@@ -287,38 +287,35 @@ class Driver(
             color = "FFFFFF"  # Default weiß
 
         try:
-            from bambulabs_api import AMSFilamentSettings
-
-            filament = AMSFilamentSettings(
-                tray_info_idx=filament_data.get("tray_info_idx", "GFL99"),
-                nozzle_temp_min=filament_data.get("nozzle_temp_min", 190),
-                nozzle_temp_max=filament_data.get("nozzle_temp_max", 230),
-                tray_type=filament_data.get("material_type", "PLA"),
-            )
             mqtt_ams_id = ams_id if ams_id < 200 else 255
             mqtt_tray_id = tray_id
             if mqtt_ams_id == 255 and tray_id < 254:
                 mqtt_tray_id = 254
-            result = self._printer.set_filament_printer(
-                color=color,
-                filament=filament,
-                ams_id=mqtt_ams_id,
-                tray_id=mqtt_tray_id,
-            )
+            settings = {
+                "command": "ams_filament_setting",
+                "ams_id": mqtt_ams_id,
+                "tray_id": mqtt_tray_id,
+                "tray_info_idx": filament_data.get("tray_info_idx", "GFL99"),
+                "tray_color": f"{color.upper()}FF",
+                "nozzle_temp_min": filament_data.get("nozzle_temp_min", 190),
+                "nozzle_temp_max": filament_data.get("nozzle_temp_max", 230),
+                "tray_type": filament_data.get("material_type", "PLA"),
+            }
+            if filament_data.get("setting_id"):
+                settings["setting_id"] = filament_data["setting_id"]
+
+            # bambulabs_api omits setting_id when serializing filament settings.
+            mqtt = self._printer.mqtt_client
+            if not mqtt._client.is_connected():
+                logger.error("Cannot send filament setting: MQTT disconnected")
+                return
+            command = mqtt._client.publish(mqtt.command_topic, json.dumps({"print": settings}))
+            command.wait_for_publish()
+            result = command.is_published()
             self.log_debug(
                 "out",
-                f"device/{self._serial}/request",
-                {
-                    "command": "ams_filament_setting",
-                    "ams_id": mqtt_ams_id,
-                    "tray_id": mqtt_tray_id,
-                    "tray_info_idx": filament_data.get("tray_info_idx", "GFL99"),
-                    "tray_color": f"{color.upper()}FF",
-                    "nozzle_temp_min": filament_data.get("nozzle_temp_min", 190),
-                    "nozzle_temp_max": filament_data.get("nozzle_temp_max", 230),
-                    "tray_type": filament_data.get("material_type", "PLA"),
-                    "success": result,
-                },
+                mqtt.command_topic,
+                {**settings, "success": result},
             )
             logger.info(
                 f"Sent filament setting to printer {self.printer_id}: slot {ams_id}-{tray_id}"
