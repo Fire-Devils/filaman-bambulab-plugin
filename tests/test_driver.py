@@ -837,6 +837,69 @@ class SlotProcessingTests(unittest.TestCase):
         self.assertEqual(driver._current_slots[0]["tray_type"], "PETG")
 
 
+class FilamentSettingTests(unittest.TestCase):
+    def setUp(self):
+        from bambulabs_api import Printer as BambuPrinter
+        from bambulabs_api import PrinterMQTTClient
+
+        self.driver, _ = make_driver(serial="TEST-SERIAL")
+        self.client = Mock()
+        self.client.is_connected.return_value = True
+        self.client.publish.return_value.is_published.return_value = True
+        mqtt = PrinterMQTTClient.__new__(PrinterMQTTClient)
+        mqtt._client = self.client
+        mqtt.command_topic = "device/TEST-SERIAL/request"
+        printer = BambuPrinter.__new__(BambuPrinter)
+        printer.mqtt_client = mqtt
+        self.driver._printer = printer
+
+    def test_sends_custom_profile_and_setting_id_in_one_mqtt_command(self):
+        self.driver._do_send_filament_setting(129, 0, {
+            "tray_info_idx": "P618a7ac", "setting_id": "PFUSed1e487ad8098f",
+            "nozzle_temp_min": 250, "nozzle_temp_max": 270,
+            "material_type": "ASA+", "color": "aabbcc80",
+        })
+
+        self.assertEqual(self.client.publish.call_count, 1)
+        topic, payload = self.client.publish.call_args.args
+        self.assertEqual(topic, "device/TEST-SERIAL/request")
+        self.assertEqual(json.loads(payload), {"print": {
+            "command": "ams_filament_setting", "ams_id": 129, "tray_id": 0,
+            "tray_info_idx": "P618a7ac", "setting_id": "PFUSed1e487ad8098f",
+            "nozzle_temp_min": 250, "nozzle_temp_max": 270,
+            "tray_type": "ASA+", "tray_color": "AABBCCFF",
+        }})
+        self.client.publish.return_value.wait_for_publish.assert_called_once_with()
+
+    def test_omits_empty_setting_id_and_preserves_external_slot_mapping(self):
+        for setting_id in (None, ""):
+            with self.subTest(setting_id=setting_id):
+                self.client.reset_mock()
+                self.driver._do_send_filament_setting(200, 0, {"setting_id": setting_id})
+
+                self.assertEqual(self.client.publish.call_count, 1)
+                payload = json.loads(self.client.publish.call_args.args[1])["print"]
+                self.assertEqual(payload, {
+                    "command": "ams_filament_setting", "ams_id": 255, "tray_id": 254,
+                    "tray_info_idx": "GFL99", "nozzle_temp_min": 190,
+                    "nozzle_temp_max": 230, "tray_type": "PLA", "tray_color": "FFFFFFFF",
+                })
+
+    def test_disconnected_or_read_only_never_publishes(self):
+        for read_only, connected in ((True, True), (False, False)):
+            with self.subTest(read_only=read_only, connected=connected):
+                self.driver._read_only = read_only
+                self.client.is_connected.return_value = connected
+                self.driver._do_send_filament_setting(129, 0, {"setting_id": "PFUS123"})
+                self.client.publish.assert_not_called()
+
+    def test_publish_error_is_contained(self):
+        self.client.publish.side_effect = RuntimeError("MQTT unavailable")
+        with self.assertLogs(DRIVER_MODULE.logger, level="ERROR") as logs:
+            self.driver._do_send_filament_setting(129, 0, {})
+        self.assertIn("MQTT unavailable", logs.output[0])
+
+
 class ReadOnlyTests(unittest.IsolatedAsyncioTestCase):
     async def test_direct_assignment_in_read_only_records_spool_without_mqtt(self):
         """Manual non-RFID assignment must work with each supported ID handoff."""
