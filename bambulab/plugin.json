@@ -1,4 +1,5 @@
 {
+  "icon": "icon.svg",
   "plugin_key": "bambulab",
   "name": "Bambu Lab",
   "driver_key": "bambulab",
