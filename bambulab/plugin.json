@@ -1,9 +1,10 @@
 {
+  "icon": "icon.svg",
   "plugin_key": "bambulab",
   "name": "Bambu Lab",
   "driver_key": "bambulab",
   "plugin_type": "driver",
-  "version": "2.9.1",
+  "version": "2.10.1",
   "description": "Bambu Lab printer driver via bambulabs_api with AMS and all-spool gallery views, optional catalog images, RFID spool discovery, estimated-weight synchronization and automatic filament matching. Note: Sending filament settings (spool assignment) requires LAN-only mode AND Developer Mode enabled on the printer. Read-only mode never sends state-changing MQTT commands.",
   "author": "FilaMan",
   "homepage": "https://www.filaman.app",
