@@ -2706,6 +2706,75 @@ class AutoImportDatabaseTests(unittest.IsolatedAsyncioTestCase):
             count = await db.scalar(select(func.count()).select_from(Spool))
         self.assertEqual(count, 0)
 
+    async def test_imports_pla_cf_without_matching_plain_pla_of_the_same_color(self):
+        slot = {
+            **self.slot,
+            "tray_info_idx": "GFA50",
+            "tray_type": "PLA-CF",
+            "tray_sub_brands": "PLA-CF",
+            "tray_color": "000000FF",
+        }
+        async with self.sessions() as db:
+            plain = await db.get(Filament, self.filament_id)
+            black = Color(name="Black", hex_code="#000000")
+            db.add(black)
+            await db.flush()
+            db.add(FilamentColor(filament_id=plain.id, color_id=black.id, position=2))
+            await db.flush()
+            self.assertIsNone(await self.driver._find_matching_filament(db, slot))
+
+            pla_cf = Filament(
+                manufacturer_id=plain.manufacturer_id,
+                designation="Bambu PLA-CF",
+                material_type="PLA",
+                material_subgroup="CF",
+                diameter_mm=1.75,
+            )
+            db.add(pla_cf)
+            await db.flush()
+            db.add(FilamentColor(filament_id=pla_cf.id, color_id=black.id, position=1))
+            await db.commit()
+            pla_cf_id = pla_cf.id
+
+        self.driver._current_slots = [slot]
+        await self.driver._auto_import_rfid_spools([slot])
+
+        async with self.sessions() as db:
+            self.assertEqual(await db.scalar(select(Spool.filament_id)), pla_cf_id)
+
+            exact = Filament(
+                manufacturer_id=plain.manufacturer_id,
+                designation="PLA-CF Black",
+                material_type="PLA-CF",
+                diameter_mm=1.75,
+            )
+            db.add(exact)
+            await db.flush()
+            db.add(FilamentColor(filament_id=exact.id, color_id=black.id, position=1))
+            await db.flush()
+            match = await self.driver._find_matching_filament(db, slot)
+            self.assertEqual(match.id, exact.id)
+
+            db.add(FilamentPrinterParam(
+                filament_id=pla_cf_id,
+                printer_id=1,
+                param_key="bambu_tray_idx",
+                param_value="GFA50",
+            ))
+            await db.flush()
+            match = await self.driver._find_matching_filament(db, slot)
+            self.assertEqual(match.id, pla_cf_id)
+
+            db.add(FilamentPrinterParam(
+                filament_id=exact.id,
+                printer_id=1,
+                param_key="bambu_tray_idx",
+                param_value="GFA50",
+            ))
+            await db.flush()
+            match = await self.driver._find_matching_filament(db, slot)
+            self.assertEqual(match.id, exact.id)
+
     async def test_prefers_coded_filamentdb_record_for_charcoal(self):
         async with self.sessions() as db:
             manufacturer = (

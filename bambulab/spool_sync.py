@@ -10,7 +10,7 @@ import time
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm.attributes import flag_modified
 
@@ -108,10 +108,21 @@ class SpoolSyncMixin:
                     "Bambu material/subtype/color matching"
                 )
 
-        tray_type = str(slot.get("tray_type") or "").strip()
+        tray_type = str(slot.get("tray_type") or "").strip().lower()
         tray_color = self._normalize_tray_color(slot.get("tray_color"))
         if not tray_type or not tray_color:
             return None
+
+        material_type = func.lower(Filament.material_type)
+        material_matches = material_type == tray_type
+        if tray_type == "pla-cf":
+            material_matches = or_(
+                material_matches,
+                and_(
+                    material_type == "pla",
+                    func.lower(func.trim(Filament.material_subgroup)) == "cf",
+                ),
+            )
 
         result = await db.execute(
             select(Filament)
@@ -120,18 +131,27 @@ class SpoolSyncMixin:
             .join(Color, Color.id == FilamentColor.color_id)
             .where(
                 func.lower(Manufacturer.name).in_(("bambu", "bambu lab")),
-                func.lower(Filament.material_type) == tray_type.lower(),
+                material_matches,
                 func.lower(Color.hex_code) == f"#{tray_color}".lower(),
             )
         )
         candidates = list(result.scalars().unique().all())
+        exact_type = candidates
+        if tray_type == "pla-cf":
+            exact_type = [
+                item for item in candidates if item.material_type.lower() == tray_type
+            ]
         if tray_index_candidate_ids:
+            # A tray-index match wins, with the original material spelling as a tiebreaker.
             indexed_candidates = [
+                item for item in exact_type if item.id in tray_index_candidate_ids
+            ] or [
                 item for item in candidates if item.id in tray_index_candidate_ids
             ]
             selected = self._select_bambu_candidate(indexed_candidates, slot)
             if selected is not None:
                 return selected
+        candidates = exact_type or candidates
         mapped_name = self._bambu_filaments.get(tray_info_idx)
         if mapped_name:
             exact = [
