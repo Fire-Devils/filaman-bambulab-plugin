@@ -1531,6 +1531,26 @@ class ReadOnlyTests(unittest.IsolatedAsyncioTestCase):
             await driver.send_filament_to_tray(255, 0, {}, spool_id=42)
         driver._update_spool_location.assert_not_awaited()
 
+    async def test_shared_scan_ignores_profile_changes_on_an_occupied_external_tray(self):
+        driver, _ = make_driver()
+        driver._send_filament_setting = Mock()
+        external = {"id": "254", "tray_type": "PLA", "tray_color": "FF0000FF"}
+        driver._process_slots({"print": {
+            "vt_tray": external,
+            "ams": {"tray_exist_bits": "0", "ams": [{"id": "0", "tray": [{"id": "0"}]}]},
+        }})
+        claim = Mock(return_value=True)
+        filament = {"material_type": "PETG"}
+        await driver.assign_pending_spool(42, filament, claim=claim)
+        driver._process_slots({"print": {"vt_tray": {**external, "tray_color": "0000FFFF"}}})
+
+        claim.assert_not_called()
+        driver._send_filament_setting.assert_not_called()
+        driver._process_slots({"print": {"ams": {"tray_exist_bits": "1"}}})
+        claim.assert_called_once_with()
+        self.assertEqual(driver.health()["slots"][0]["spool_id"], 42)
+        driver._send_filament_setting.assert_called_once_with(0, 0, filament)
+
     async def test_failed_claim_drops_pending_before_sending_or_linking(self):
         driver, _ = make_driver()
         driver._send_filament_setting = Mock()

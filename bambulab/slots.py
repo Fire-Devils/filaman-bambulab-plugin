@@ -589,9 +589,10 @@ class SlotSupportMixin:
                 candidates.append((0, slot, parsed))
             elif not has_presence and slot.get("tray_type"):
                 fields = ("tray_info_idx", "tray_type", "tray_color", "cali_idx")
-                if not old.get("present") or any(slot.get(k) != old.get(k) for k in fields) or (
+                profile_changed = any(slot.get(k) != old.get(k) for k in fields) or (
                     slot.get("setting_id") and slot["setting_id"] != old.get("setting_id")
-                ):
+                )
+                if not old.get("present") or (pending.claim is None and profile_changed):
                     candidates.append((1, slot, parsed))
 
         if candidates:
