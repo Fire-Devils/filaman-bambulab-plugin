@@ -354,14 +354,17 @@ class SlotSupportMixin:
             old_slot = previous.get(slot_index, {})
             tray = reported.get(slot_index, {})
             state = str(tray.get("state"))
+            id_only = len(tray) == 1 and "id" in tray
             if state in _AMS_STATE_PRESENCE:
                 self._ams_state_presence[slot_index] = _AMS_STATE_PRESENCE[state]
+            elif id_only:
+                self._ams_state_presence.pop(slot_index, None)
 
             present = self._ams_reported_presence(ams_id, tray_id)
             if present is None:
                 if not tray:
                     present = old_slot.get("present", False)
-                elif len(tray) == 1 and "id" in tray:
+                elif id_only:
                     present = False  # Legacy empty trays can contain only the ID.
                 else:
                     present = bool(tray["tray_type"]) if "tray_type" in tray else old_slot.get("present", False)

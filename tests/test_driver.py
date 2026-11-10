@@ -528,6 +528,21 @@ class SlotProcessingTests(unittest.TestCase):
             [True, False, True, False],
         )
 
+    def test_legacy_id_only_removal_overrides_cached_tray_state(self):
+        driver, _ = make_driver()
+        driver._schedule_slot_location_release = Mock()
+        trays = [{"id": "0", "state": 11, "tray_type": "PLA"}]
+        ams = {"ams": [{"id": "0", "tray": trays}]}
+        driver._process_slots({"print": {"ams": ams}})
+        driver._slot_spool_ids["0-0"] = 17
+
+        trays[0] = {"id": "0"}
+        driver._process_slots({"print": {"ams": ams}})
+        slot = driver.health()["slots"][0]
+        self.assertFalse(slot["present"])
+        self.assertIsNone(slot["spool_id"])
+        driver._schedule_slot_location_release.assert_called_once_with("0-0")
+
     def test_p2s_shutdown_preserves_loaded_slots_but_real_zero_mask_releases_them(self):
         for model, powered, releases in (
             ("P2S", False, False), ("P2S", True, True), ("X1C", False, True),
@@ -1309,6 +1324,37 @@ class ReadOnlyTests(unittest.IsolatedAsyncioTestCase):
         driver._printer = object()
         dispatched = driver._send_filament_setting(0, 0, {"material_type": "PLA"})
         self.assertFalse(dispatched)
+
+    async def test_reconnect_keeps_spool_when_material_delta_precedes_occupancy(self):
+        for initial_occupancy in ({"tray_exist_bits": "1"}, {}):
+            with self.subTest(initial_occupancy=initial_occupancy):
+                driver, _ = make_driver(read_only=True)
+                driver._schedule_slot_location_release = Mock()
+                driver._sync_slot_location = AsyncMock()
+
+                def report(tray, **ams_fields):
+                    driver._process_slots({"print": {"ams": {
+                        **ams_fields, "ams": [{"id": "0", "tray": [tray]}],
+                    }}})
+
+                tray = {"id": "0", "tray_type": "PLA"}
+                if not initial_occupancy:
+                    tray["state"] = 11
+                report(tray, **initial_occupancy)
+                await driver.send_filament_to_tray(0, 0, {}, spool_id=17)
+
+                driver._begin_slot_sync()
+                report({"id": "0", "tray_type": "", "tray_info_idx": "",
+                        "tray_color": "00000000"})
+
+                slot = driver.health()["slots"][0]
+                self.assertTrue(slot["present"])
+                self.assertEqual(slot["spool_id"], 17)
+                driver._schedule_slot_location_release.assert_not_called()
+
+                report({"id": "0", "state": 8})
+                self.assertFalse(driver.health()["slots"][0]["present"])
+                driver._schedule_slot_location_release.assert_called_once_with("0-0")
 
     async def test_reconnect_reports_removal_from_mask_without_repeating_trays(self):
         driver, events = make_driver(printer_model="P2S")

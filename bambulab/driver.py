@@ -252,8 +252,15 @@ class Driver(
         self.log_debug("event", "mqtt", {"event": "connected", "rc": str(rc)})
 
     def _begin_slot_sync(self) -> None:
+        # Keep confirmed loads until a fresh mask or state can prove removal.
+        occupied = {}
+        for slot in self._current_slots:
+            sid = slot["slot_index"]
+            address = self._parse_slot_index(sid)
+            if address and self._ams_reported_presence(*address) is True:
+                occupied[sid] = True
         self._tray_exist_bits = None
-        self._ams_state_presence.clear()
+        self._ams_state_presence = occupied
         self._needs_slot_sync = True
 
     def _on_disconnect(
