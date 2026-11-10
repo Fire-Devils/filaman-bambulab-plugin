@@ -1,5 +1,5 @@
-import importlib
 import asyncio
+import importlib
 import json
 import unittest
 from pathlib import Path
@@ -15,7 +15,6 @@ from app.models.printer import PrinterSlot
 from app.models.printer_params import FilamentPrinterParam
 from app.models.spool import Spool, SpoolStatus
 from app.models.system_extra_field import SystemExtraField
-
 
 DRIVER_MODULE = importlib.import_module("bambulab.driver")
 STATE_MODULE = importlib.import_module("bambulab.state")

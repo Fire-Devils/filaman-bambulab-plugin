@@ -4,7 +4,6 @@ The helpers in this module avoid database and network access. The mixin turns
 partial Bambu status messages into a stable slot snapshot for the main driver.
 """
 
-import asyncio
 import json
 import logging
 import re
@@ -235,7 +234,6 @@ class SlotSupportMixin:
             "external_spool": has_external,
             "ams_units": self._current_ams_units,
         }
-
 
     def _process_version_info(self, payload: dict) -> None:
         """AMS Seriennummern aus get_version/push_info Antwort extrahieren."""

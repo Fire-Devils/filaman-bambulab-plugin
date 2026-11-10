@@ -194,7 +194,6 @@ class Driver(
             self._printer = None
         self._connected = False
 
-
     async def refresh_status(self) -> dict[str, Any]:
         """Reconcile catalog images when FilaMan requests an explicit refresh.
 
@@ -241,7 +240,6 @@ class Driver(
                 "ams_info": self._build_ams_info(updated_slots),
             }
         )
-
 
     def _on_connect(self, mqtt_client, client, userdata, flags, rc, properties):
         """Wird im paho-Thread aufgerufen wenn MQTT verbunden ist."""
@@ -305,7 +303,6 @@ class Driver(
             logger.error(f"Failed to decode MQTT message: {e}")
         except Exception as e:
             logger.error(f"Error handling MQTT message: {e}")
-
 
     def _handle_slot_status(self, payload: dict) -> None:
         # Keep MQTT, pending assignments and RFID results on the same event loop.

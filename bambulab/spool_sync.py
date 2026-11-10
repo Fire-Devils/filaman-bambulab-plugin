@@ -502,7 +502,6 @@ class SpoolSyncMixin:
                 await event_bus.publish({"event": "spools_changed"})
                 self._emit_slots_with_spool_ids()
 
-
     def _generate_slot_location_name(self, ams_id: int, tray_id: int) -> str:
         """Generiert Location-Namen für AMS-Slot.
 
