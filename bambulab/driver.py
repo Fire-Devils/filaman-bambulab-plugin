@@ -428,7 +428,8 @@ class Driver(
         spool_id: int | None = None,
     ) -> None:
         """Assign a FilaMan spool directly; read-only suppresses only MQTT writes."""
-        ams_id, tray_id = self._wire_tray_address(ams_id, tray_id)
+        wire_address = self._wire_tray_address(ams_id, tray_id)
+        ams_id, tray_id = self._live_tray_address(ams_id, tray_id)
         filaman_spool_id = spool_id or filament_data.get("filaman_spool_id") or filament_data.get("id")
         if filaman_spool_id:
             filaman_spool_id = int(filaman_spool_id)
@@ -445,8 +446,11 @@ class Driver(
                     raise TypeError(
                         "Cannot verify spool occupancy in this Bambu slot in read-only mode"
                     )
+                if self._pending is not None:
+                    raise TypeError("Cannot wait for an unverified slot while a spool assignment is pending")
+                pending_index = f"{wire_address[0]}-{wire_address[1]}"
                 self._arm_pending_spool(
-                    PendingSpool(filaman_spool_id, filament_data, slot_index, send_setting=False),
+                    PendingSpool(filaman_spool_id, filament_data, pending_index, send_setting=False),
                     self._timeout_seconds,
                 )
             else:
@@ -456,7 +460,7 @@ class Driver(
                 if self._slot_spool_ids.get(slot_index) != filaman_spool_id:
                     return
                 self._emit_slots_with_spool_ids()
-        self._send_filament_setting(ams_id, tray_id, filament_data)
+        self._send_filament_setting(*wire_address, filament_data)
 
     # -- Pending-Spool API ----------------------------------------------------
 
@@ -478,6 +482,8 @@ class Driver(
         """
         if claim is not None and not callable(claim):
             raise TypeError("claim must be callable")
+        if self._pending is not None and not self._pending.send_setting:
+            raise TypeError("Cannot arm a scan while direct spool assignment is pending")
         if slot_index is not None:
             parsed_slot = self._parse_slot_index(slot_index)
             if parsed_slot:

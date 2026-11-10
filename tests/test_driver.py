@@ -1400,7 +1400,7 @@ class ReadOnlyTests(unittest.IsolatedAsyncioTestCase):
         driver._process_slots({"print": {"vir_slot": [{"id": "1", "tray_type": ""}]}})
         await driver.assign_pending_spool(42, {"material_type": "PLA"}, slot_index="255-1")
         driver._process_slots({"print": {"vir_slot": [{"id": "255", "tray_type": "PLA"}]}})
-        self.assertEqual(driver.health()["slots"][0]["slot_index"], "255-255")
+        self.assertEqual(driver.health()["slots"][0]["slot_index"], "255-1")
         self.assertEqual(driver.health()["slots"][0]["spool_id"], 42)
 
     async def test_direct_link_to_confirmed_empty_slot_cannot_move_inventory(self):
@@ -1430,6 +1430,35 @@ class ReadOnlyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(driver.health()["slots"][0]["spool_id"], 42)
         driver._schedule_slot_location_update.assert_called_once_with("255-255", 42)
         driver._send_filament_setting.assert_called_once_with(255, 255, filament)
+
+    async def test_unverified_direct_assignment_cannot_replace_a_pending_scan(self):
+        driver, _ = make_driver()
+        driver._send_filament_setting = Mock()
+        driver._process_slots({"print": {"ams": {
+            "tray_exist_bits": "0", "ams": [{"id": "0", "tray": [{"id": "0"}]}],
+        }}})
+        filament = {"material_type": "PLA"}
+        await driver.assign_pending_spool(17, filament)
+
+        with self.assertRaisesRegex(TypeError, "pending"):
+            await driver.send_filament_to_tray(255, 1, filament, spool_id=22)
+        driver._send_filament_setting.assert_not_called()
+        driver._process_slots({"print": {"ams": {"tray_exist_bits": "1"}}})
+        self.assertEqual(driver.health()["slots"][0]["spool_id"], 17)
+        driver._send_filament_setting.assert_called_once_with(0, 0, filament)
+
+    async def test_scan_cannot_claim_feedback_for_a_direct_assignment(self):
+        driver, _ = make_driver()
+        driver._send_filament_setting = Mock()
+        driver._process_slots({"print": {"vt_tray": {"id": "254", "tray_type": ""}}})
+        filament = {"material_type": "PLA"}
+        await driver.send_filament_to_tray(255, 0, filament, spool_id=22)
+
+        with self.assertRaisesRegex(TypeError, "pending"):
+            await driver.assign_pending_spool(17, {"material_type": "PETG"})
+        driver._process_slots({"print": {"vt_tray": {"id": "254", "tray_type": "PLA"}}})
+        self.assertEqual(driver.health()["slots"][0]["spool_id"], 22)
+        driver._send_filament_setting.assert_called_once_with(255, 254, filament)
 
     async def test_read_only_direct_link_cannot_verify_blank_external(self):
         driver, _ = make_driver(read_only=True)
@@ -1821,6 +1850,45 @@ class AutoImportDatabaseTests(unittest.IsolatedAsyncioTestCase):
         async with self.sessions() as db:
             spool = await db.get(Spool, spool_id)
         self.assertIsNone(spool.location_id)
+
+    async def test_external_tray_aliases_share_the_existing_managed_location(self):
+        spool_id = await self._spool_carrying({})
+        await self.driver._update_spool_location(spool_id, 255, 0)
+        self.driver._read_only = True
+        self.driver._process_slots({"print": {"vir_slot": [{"id": "254", "tray_type": "PLA"}]}})
+        await self.driver.send_filament_to_tray(255, 0, {}, spool_id=spool_id)
+
+        async with self.sessions() as db:
+            location = (await db.execute(select(Location))).scalar_one()
+            self.assertEqual(location.identifier, "bambulab_1_255_0")
+            self.assertEqual(location.name, "Test Printer - ext. Slot 1")
+
+        self.driver._process_slots({"print": {"vir_slot": [{"id": "0", "tray_type": ""}]}})
+        await asyncio.sleep(0)
+        await asyncio.gather(*(asyncio.all_tasks() - {asyncio.current_task()}))
+        async with self.sessions() as db:
+            spool = await db.get(Spool, spool_id)
+            self.assertIsNone(spool.location_id)
+
+    async def test_external_removal_releases_both_historical_alias_locations(self):
+        first = await self._spool_carrying({})
+        second = await self._spool_carrying({})
+        async with self.sessions() as db:
+            for tray_id, spool_id in ((0, first), (254, second)):
+                location = Location(
+                    name=f"Legacy external slot {tray_id}",
+                    identifier=f"bambulab_1_255_{tray_id}",
+                )
+                db.add(location)
+                await db.flush()
+                spool = await db.get(Spool, spool_id)
+                spool.location_id = location.id
+            await db.commit()
+
+        await self.driver._release_slot_location(255, 254)
+        async with self.sessions() as db:
+            self.assertIsNone((await db.get(Spool, first)).location_id)
+            self.assertIsNone((await db.get(Spool, second)).location_id)
 
     async def test_initial_topology_retires_a_saved_ams_slot_without_inventing_live_slots(self):
         spool_id = await self._spool_carrying({})

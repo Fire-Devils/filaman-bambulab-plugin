@@ -565,18 +565,25 @@ class SpoolSyncMixin:
         )
         location.custom_fields = custom_fields
 
-    async def _find_slot_location(
+    async def _find_slot_locations(
         self, db, ams_id: int, tray_id: int, *, adopt_by_name: bool = True
-    ) -> Location | None:
-        """Find the stable slot or conservatively adopt an owned legacy row."""
+    ) -> list[Location]:
+        """Find slot locations in preference order, including historical aliases."""
         identifier = self._generate_slot_location_identifier(ams_id, tray_id)
-        result = await db.execute(
-            select(Location).where(Location.identifier == identifier)
+        identifiers = [identifier]
+        if ams_id == 255 and tray_id in (0, 1, 254, 255):
+            alias = tray_id - 254 if tray_id >= 254 else tray_id + 254
+            identifiers.append(self._generate_slot_location_identifier(ams_id, alias))
+        result = await db.scalars(
+            select(Location)
+            .where(Location.identifier.in_(identifiers))
+            .order_by((Location.identifier == identifier).desc())
         )
-        location = result.scalar_one_or_none()
-        if location is not None:
-            self._refresh_slot_location_metadata(location)
-            return location
+        locations = list(result)
+        if locations:
+            for location in locations:
+                self._refresh_slot_location_metadata(location)
+            return locations
 
         # Current plugin versions always set an identifier. Only identifier-less
         # rows can be legacy candidates; a manual or foreign location with its
@@ -605,9 +612,7 @@ class SpoolSyncMixin:
             managed_candidates.append(candidate)
 
         if len(managed_candidates) == 1:
-            return self._adopt_legacy_slot_location(
-                managed_candidates[0], identifier
-            )
+            return [self._adopt_legacy_slot_location(managed_candidates[0], identifier)]
         if len(managed_candidates) > 1:
             logger.warning(
                 "Multiple identifier-less Bambu locations claim printer %s; "
@@ -616,10 +621,10 @@ class SpoolSyncMixin:
                 ams_id,
                 tray_id,
             )
-            return None
+            return []
 
         if not adopt_by_name:
-            return None
+            return []
 
         name_candidates = [
             candidate
@@ -627,14 +632,14 @@ class SpoolSyncMixin:
             if str(candidate.name or "").casefold() == legacy_name.casefold()
         ]
         if len(name_candidates) == 1:
-            return self._adopt_legacy_slot_location(name_candidates[0], identifier)
+            return [self._adopt_legacy_slot_location(name_candidates[0], identifier)]
         if len(name_candidates) > 1:
             logger.warning(
                 "Multiple locations match legacy Bambu slot name '%s'; "
                 "not adopting any",
                 legacy_name,
             )
-        return None
+        return []
 
     async def _unique_slot_location_name(
         self,
@@ -703,15 +708,15 @@ class SpoolSyncMixin:
         slot_location_name = self._generate_slot_location_name(ams_id, tray_id)
         try:
             async with async_session_maker() as db:
-                location = await self._find_slot_location(db, ams_id, tray_id, adopt_by_name=False)
-                if location is None:
-                    return
-                await self._clear_slot_location(
-                    db,
-                    location,
-                    location.name or slot_location_name,
-                    keep_spool_id=None,
+                locations = await self._find_slot_locations(
+                    db, ams_id, tray_id, adopt_by_name=False
                 )
+                if not locations:
+                    return
+                for location in locations:
+                    await self._clear_slot_location(
+                        db, location, location.name or slot_location_name, keep_spool_id=None
+                    )
                 # Also persists a conservative legacy-location adoption even if
                 # the already-empty location contained no spool to release.
                 await db.commit()
@@ -736,11 +741,12 @@ class SpoolSyncMixin:
             async with async_session_maker() as db:
                 # The identifier represents the physical slot. Its display name
                 # may change when the printer is renamed and is not an identity.
-                location = await self._find_slot_location(db, ams_id, tray_id)
+                locations = await self._find_slot_locations(db, ams_id, tray_id)
+                location = locations[0] if locations else None
                 slot_location_name = await self._unique_slot_location_name(
                     db,
                     preferred_name,
-                    identifier,
+                    location.identifier if location else identifier,
                 )
 
                 # 2. Location erstellen falls nicht vorhanden
@@ -774,9 +780,10 @@ class SpoolSyncMixin:
 
                 # Ein Tray hält eine Spule. Wer sonst noch auf diesem Lagerort
                 # steht, lag früher einmal darin und liegt längst woanders.
-                await self._clear_slot_location(
-                    db, location, slot_location_name, keep_spool_id=filaman_spool_id
-                )
+                for existing in locations:
+                    await self._clear_slot_location(
+                        db, existing, existing.name or slot_location_name, keep_spool_id=filaman_spool_id
+                    )
 
                 if spool.location_id == location.id:
                     logger.debug(

@@ -275,6 +275,17 @@ class SlotSupportMixin:
             tray_id = 255 if tray_id == 1 else 254
         return 255, tray_id
 
+    def _live_tray_address(self, ams_id: int, tray_id: int) -> tuple[int, int]:
+        """Retain the reported external slot identity when only its address spelling changes."""
+        if ams_id < 200:
+            return ams_id, tray_id
+        wire_address = self._wire_tray_address(ams_id, tray_id)
+        for slot in self._current_slots:
+            address = self._parse_slot_index(slot["slot_index"])
+            if address and self._wire_tray_address(*address) == wire_address:
+                return address
+        return 255, tray_id
+
     @staticmethod
     def _ams_tray_bit_index(ams_id: int, tray_id: int) -> int | None:
         # Bambu reserves bits 0–15 for four-slot units and 16–23 for AMS HT.
@@ -488,8 +499,8 @@ class SlotSupportMixin:
                     tray_id = int(tray.get("id", 254 + external_index))
                 except (TypeError, ValueError):
                     tray_id = 254 + external_index
-                _, tray_id = self._wire_tray_address(255, tray_id)
-                external_number = tray_id - 253
+                _, tray_id = self._live_tray_address(255, tray_id)
+                external_number = tray_id - 253 if tray_id >= 254 else external_index + 1
                 ext_slots.append(
                     {
                         "slot_index": f"255-{tray_id}",
@@ -550,13 +561,16 @@ class SlotSupportMixin:
             if replaced or (spool_id is not None and spool_id != previous_spool_id):
                 locations[sid] = spool_id
 
-            if pending is None or pending.slot_index not in (None, sid):
+            if pending is None:
+                continue
+            parsed = self._parse_slot_index(sid)
+            wire_ams_id, wire_tray_id = self._wire_tray_address(*parsed)
+            if pending.slot_index not in (None, f"{wire_ams_id}-{wire_tray_id}"):
                 continue
             if old is None:
                 if pending.send_setting:
                     continue  # A first snapshot is not a scale-scan insertion.
                 old = {}
-            parsed = self._parse_slot_index(sid)
             has_presence = self._ams_reported_presence(*parsed) is not None
             if replaced or (has_presence and not old.get("present")):
                 candidates.append((0, slot, parsed))
