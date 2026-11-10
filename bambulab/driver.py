@@ -9,6 +9,8 @@ import asyncio
 import json
 import logging
 import threading
+from concurrent.futures import Future, TimeoutError
+from itertools import count
 from typing import Any, Callable
 
 from sqlalchemy import select
@@ -27,6 +29,8 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_TIMEOUT = 60
 DEFAULT_RECONNECT_INTERVAL = 5
+FILAMENT_SETTING_TIMEOUT = 5
+_FILAMENT_SETTING_SEQUENCES = count(10000)
 
 
 class Driver(
@@ -52,6 +56,8 @@ class Driver(
         super().__init__(printer_id, config, emitter)
         self._printer: Any = None  # bambulabs_api.Printer
         self._pending: PendingSpool | None = None
+        self._filament_acks: dict[str, Future[dict]] = {}
+        self._filament_acks_lock = threading.Lock()
         self._timeout_seconds = (
             DEFAULT_TIMEOUT  # Can be overridden per assign_pending_spool call
         )
@@ -116,8 +122,9 @@ class Driver(
 
         # Callbacks laufen im paho-Thread
         self._printer.mqtt_client.on_connect_handler = self._on_connect
-        self._printer.mqtt_client.on_message_handler = self._on_message
         self._printer.mqtt_client.on_disconnect_handler = self._on_disconnect
+        # The library's unused status cache rejects flat printer acknowledgments.
+        self._printer.mqtt_client._client.on_message = self._on_message
 
         # Reconnect-Backoff konfigurieren (paho auto-reconnect via loop_start)
         self._printer.mqtt_client._client.reconnect_delay_set(
@@ -262,14 +269,27 @@ class Driver(
         self.log_debug("event", "mqtt", {"event": "disconnected", "rc": str(rc)})
         # paho auto-reconnect via loop_start() (reconnect_on_failure=True)
 
-    def _on_message(self, mqtt_client, client, userdata, msg):
+    def _on_message(self, client, userdata, msg):
         """Wird im paho-Thread für jede MQTT-Nachricht aufgerufen."""
         try:
             payload = json.loads(msg.payload.decode())
             self.log_debug("in", str(msg.topic), payload)
 
+            print_report = payload.get("print", {})
+            report = payload if payload.get("command") == "ams_filament_setting" else print_report
+            if (
+                isinstance(report, dict)
+                and report.get("command") == "ams_filament_setting"
+                and report.get("result")
+            ):
+                with self._filament_acks_lock:
+                    ack = self._filament_acks.pop(str(report.get("sequence_id")), None)
+                if ack is not None:
+                    ack.set_result(report)
+                return
+
             # push_status Nachrichten verarbeiten
-            if payload.get("print", {}).get("command") == "push_status":
+            if isinstance(print_report, dict) and print_report.get("command") == "push_status":
                 if self._loop:
                     self._loop.call_soon_threadsafe(self._handle_slot_status, payload)
                 return
@@ -315,7 +335,7 @@ class Driver(
     def _do_send_filament_setting(
         self, ams_id: int, tray_id: int, filament_data: dict
     ) -> None:
-        """Blockierender Filament-Setting Versand (Thread-Pool)."""
+        """Publish the setting and wait briefly for the printer's reply."""
         if self._read_only:
             logger.warning(
                 f"Read-only mode: blocked filament setting for slot {ams_id}-{tray_id}"
@@ -331,10 +351,12 @@ class Driver(
         elif len(color) != 6:
             color = "FFFFFF"  # Default weiß
 
+        sequence = str(next(_FILAMENT_SETTING_SEQUENCES))
         try:
             mqtt_ams_id, mqtt_tray_id = self._wire_tray_address(ams_id, tray_id)
             settings = {
                 "command": "ams_filament_setting",
+                "sequence_id": sequence,
                 "ams_id": mqtt_ams_id,
                 "tray_id": mqtt_tray_id,
                 "tray_info_idx": filament_data.get("tray_info_idx", "GFL99"),
@@ -351,19 +373,38 @@ class Driver(
             if not mqtt._client.is_connected():
                 logger.error("Cannot send filament setting: MQTT disconnected")
                 return
+            ack = Future()
+            with self._filament_acks_lock:
+                self._filament_acks[sequence] = ack
             command = mqtt._client.publish(mqtt.command_topic, json.dumps({"print": settings}))
-            command.wait_for_publish()
-            result = command.is_published()
+            command.wait_for_publish(timeout=FILAMENT_SETTING_TIMEOUT)
+            published = command.is_published()
+            result, reason = "not_published", ""
+            if published:
+                try:
+                    report = ack.result(timeout=FILAMENT_SETTING_TIMEOUT)
+                    result, reason = report["result"], report.get("reason", "")
+                except TimeoutError:
+                    result = "timeout"
+
+            success = str(result).lower() == "success"
             self.log_debug(
                 "out",
                 mqtt.command_topic,
-                {**settings, "success": result},
+                {
+                    **settings, "mqtt_published": published, "printer_ack": result,
+                    "printer_reason": reason, "success": success,
+                },
             )
-            logger.info(
-                f"Sent filament setting to printer {self.printer_id}: slot {ams_id}-{tray_id}"
+            (logger.info if success else logger.warning)(
+                "Filament setting for printer %s slot %s-%s: %s, reason=%r",
+                self.printer_id, ams_id, tray_id, result, reason,
             )
         except Exception as e:
             logger.error(f"Failed to send filament setting: {e}")
+        finally:
+            with self._filament_acks_lock:
+                self._filament_acks.pop(sequence, None)
 
     async def reconnect(self) -> None:
         """Reconnect: MQTT stoppen und neu starten."""

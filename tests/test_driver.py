@@ -1153,6 +1153,7 @@ class FilamentSettingTests(unittest.TestCase):
         from bambulabs_api import PrinterMQTTClient
 
         self.driver, _ = make_driver(serial="TEST-SERIAL")
+        self.enterContext(patch.object(DRIVER_MODULE, "FILAMENT_SETTING_TIMEOUT", 0))
         self.client = Mock()
         self.client.is_connected.return_value = True
         self.client.publish.return_value.is_published.return_value = True
@@ -1162,6 +1163,71 @@ class FilamentSettingTests(unittest.TestCase):
         printer = BambuPrinter.__new__(BambuPrinter)
         printer.mqtt_client = mqtt
         self.driver._printer = printer
+
+    def test_filament_settings_use_distinct_decimal_string_sequences(self):
+        self.driver._do_send_filament_setting(129, 0, {})
+        self.driver._do_send_filament_setting(129, 1, {})
+
+        sequences = [
+            json.loads(call.args[1])["print"]["sequence_id"]
+            for call in self.client.publish.call_args_list
+        ]
+        self.assertTrue(all(isinstance(seq, str) and seq.isdecimal() for seq in sequences))
+        self.assertEqual(len(set(sequences)), 2)
+
+    def test_debug_distinguishes_printer_ack_from_mqtt_publish(self):
+        from bambulabs_api import PrinterMQTTClient
+
+        printer = self.driver._printer
+        mqtt = PrinterMQTTClient("localhost", "test", "TEST-SERIAL")
+        mqtt._client.publish = self.client.publish
+        mqtt._client.is_connected = self.client.is_connected
+        printer.mqtt_client = mqtt
+        printer.mqtt_start = Mock()
+        self.driver._load_printer_name = AsyncMock(return_value="Test Printer")
+        self.driver._load_saved_ams_slots = AsyncMock(return_value={})
+        self.driver._ensure_shared_extra_fields = AsyncMock()
+        with patch("bambulabs_api.Printer", return_value=printer):
+            asyncio.run(self.driver.start())
+
+        for result, nested, published, expected_ack in (
+            ("SUCCESS", True, True, "SUCCESS"),
+            ("FAIL", False, True, "FAIL"),
+            (None, True, True, "timeout"),
+            (None, True, False, "not_published"),
+        ):
+            with self.subTest(ack=expected_ack):
+                self.driver.clear_debug_log()
+                self.driver.enable_debug_log()
+                self.client.publish.return_value.is_published.return_value = published
+
+                def publish(topic, payload):
+                    sequence = json.loads(payload)["print"]["sequence_id"]
+                    for seq, ack_result in (("0", "SUCCESS"), (sequence, result)):
+                        if ack_result is None:
+                            continue
+                        report = {
+                            "command": "ams_filament_setting", "sequence_id": seq,
+                            "result": ack_result,
+                        }
+                        if ack_result == "FAIL":
+                            report["reason"] = "ERROR COMMAND"
+                        message = Mock(
+                            topic="device/TEST-SERIAL/report",
+                            payload=json.dumps({"print": report} if nested else report).encode(),
+                        )
+                        mqtt._client.on_message(mqtt._client, None, message)
+                    return self.client.publish.return_value
+
+                self.client.publish.side_effect = publish
+                self.driver._do_send_filament_setting(129, 0, {})
+
+                entry = self.driver.get_debug_log()[-1]["payload"]
+                self.assertEqual(entry["mqtt_published"], published)
+                self.assertEqual(entry["printer_ack"], expected_ack)
+                self.assertEqual(entry["printer_reason"], "ERROR COMMAND" if result == "FAIL" else "")
+                self.assertEqual(entry["success"], result == "SUCCESS")
+                self.assertFalse(self.driver._filament_acks)
 
     def test_sends_custom_profile_and_setting_id_in_one_mqtt_command(self):
         self.driver._do_send_filament_setting(129, 0, {
@@ -1173,13 +1239,15 @@ class FilamentSettingTests(unittest.TestCase):
         self.assertEqual(self.client.publish.call_count, 1)
         topic, payload = self.client.publish.call_args.args
         self.assertEqual(topic, "device/TEST-SERIAL/request")
-        self.assertEqual(json.loads(payload), {"print": {
+        settings = json.loads(payload)["print"]
+        settings.pop("sequence_id")
+        self.assertEqual(settings, {
             "command": "ams_filament_setting", "ams_id": 129, "tray_id": 0,
             "tray_info_idx": "P618a7ac", "setting_id": "PFUSed1e487ad8098f",
             "nozzle_temp_min": 250, "nozzle_temp_max": 270,
             "tray_type": "ASA+", "tray_color": "AABBCCFF",
-        }})
-        self.client.publish.return_value.wait_for_publish.assert_called_once_with()
+        })
+        self.client.publish.return_value.wait_for_publish.assert_called_once_with(timeout=0)
 
     def test_omits_empty_setting_id_and_preserves_external_slot_mapping(self):
         for setting_id in (None, ""):
@@ -1189,6 +1257,7 @@ class FilamentSettingTests(unittest.TestCase):
 
                 self.assertEqual(self.client.publish.call_count, 1)
                 payload = json.loads(self.client.publish.call_args.args[1])["print"]
+                payload.pop("sequence_id")
                 self.assertEqual(payload, {
                     "command": "ams_filament_setting", "ams_id": 255, "tray_id": 254,
                     "tray_info_idx": "GFL99", "nozzle_temp_min": 190,
@@ -1250,7 +1319,7 @@ class ReadOnlyTests(unittest.IsolatedAsyncioTestCase):
         def report(ams):
             message = Mock(topic="device/serial/report")
             message.payload = json.dumps({"print": {"command": "push_status", "ams": ams}}).encode()
-            driver._on_message(None, None, None, message)
+            driver._on_message(None, None, message)
 
         driver._on_connect(None, None, None, None, 0, None)
         report({
