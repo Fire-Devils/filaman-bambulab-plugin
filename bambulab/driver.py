@@ -11,8 +11,10 @@ import logging
 import threading
 from typing import Any, Callable
 
+from sqlalchemy import select
+
 from app.core.database import async_session_maker
-from app.models.printer import Printer
+from app.models.printer import Printer, PrinterSlot
 from app.plugins.base import BaseDriver
 
 from .catalog import CatalogMixin
@@ -65,7 +67,13 @@ class Driver(
             config.get("reconnect_interval_minutes", DEFAULT_RECONNECT_INTERVAL) * 60
         )
         self._current_slots: list[dict[str, Any]] = []
+        self._saved_ams_slots: dict[str, str] = {}
         self._current_ams_units: list[dict[str, Any]] = []
+        self._tray_exist_bits: int | None = None
+        self._ams_units_awaiting_occupancy: set[int] = set()
+        self._ams_state_presence: dict[str, bool] = {}
+        self._confirmed_tray_uuids: dict[str, str] = {}
+        self._needs_slot_sync = False
         self._printer_model = config.get("printer_model", "P1S")
         self._is_ams_lite = self._printer_model in ("A1", "A1_MINI")
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -82,6 +90,8 @@ class Driver(
         self._inventory_enrichment_registered = False
         self._spool_ids_by_tray_uuid: dict[str, int] = {}
         self._slot_spool_ids: dict[str, int] = {}
+        self._explicit_slot_assignments: set[str] = set()
+        self._slot_location_lock = asyncio.Lock()
         self._bambu_filaments = self._load_bambu_filaments()
 
     async def start(self) -> None:
@@ -96,6 +106,7 @@ class Driver(
         # Otherwise a fast push_status message may create a temporary
         # "Printer <id>" location before the real name is available.
         self._printer_name = await self._load_printer_name()
+        self._saved_ams_slots = await self._load_saved_ams_slots()
 
         self._printer = BambuPrinter(
             ip_address=self._host,
@@ -140,12 +151,32 @@ class Driver(
             logger.warning(f"Failed to load printer name: {e}")
             return fallback
 
+    async def _load_saved_ams_slots(self) -> dict[str, str]:
+        """Load persisted identities for topology retirement, not tray presence."""
+        try:
+            async with async_session_maker() as db:
+                rows = await db.execute(
+                    select(PrinterSlot.custom_fields, PrinterSlot.name)
+                    .where(PrinterSlot.printer_id == self.printer_id, PrinterSlot.is_active.is_(True))
+                    .order_by(PrinterSlot.slot_no)
+                )
+                slots = {}
+                for fields, name in rows:
+                    sid = fields.get("slot_index") if isinstance(fields, dict) else None
+                    parsed = self._parse_slot_index(sid) if isinstance(sid, str) else None
+                    if parsed and sid == f"{parsed[0]}-{parsed[1]}" and self._ams_tray_bit_index(*parsed) is not None:
+                        slots[sid] = name or sid
+                return slots
+        except Exception:
+            logger.exception("Failed to load saved AMS slots for printer %s", self.printer_id)
+            return {}
+
     async def stop(self) -> None:
         """Stop background services, pending assignments and MQTT connectivity."""
         self._running = False
         if self._pending and self._pending.timer:
             self._pending.timer.cancel()
-            self._pending = None
+        self._pending = None
         await self._unregister_inventory_enrichment()
         if self._printer:
             try:
@@ -187,15 +218,13 @@ class Driver(
         for current in self._current_slots:
             slot = dict(current)
             slot_index = str(slot.get("slot_index") or "")
-            tray_uuid = self._normalize_hex_identifier(slot.get("tray_uuid"), 32)
             if not slot.get("present"):
                 # FilaMan clears persisted assignments only for an explicit null.
                 slot["spool_id"] = None
                 self._slot_spool_ids.pop(slot_index, None)
-            elif tray_uuid and tray_uuid in self._spool_ids_by_tray_uuid:
-                spool_id = self._spool_ids_by_tray_uuid[tray_uuid]
-                slot["spool_id"] = spool_id
-                self._slot_spool_ids[slot_index] = spool_id
+                self._explicit_slot_assignments.discard(slot_index)
+            elif slot_index in self._slot_spool_ids:
+                slot["spool_id"] = self._slot_spool_ids[slot_index]
             updated_slots.append(slot)
         self._current_slots = updated_slots
         self.emit(
@@ -210,17 +239,23 @@ class Driver(
     def _on_connect(self, mqtt_client, client, userdata, flags, rc, properties):
         """Wird im paho-Thread aufgerufen wenn MQTT verbunden ist."""
         self._connected = True
+        if self._loop:
+            self._loop.call_soon_threadsafe(self._begin_slot_sync)
         logger.info(
             f"Bambu driver connected to printer {self.printer_id} at {self._host}"
         )
         self.log_debug("event", "mqtt", {"event": "connected", "rc": str(rc)})
+
+    def _begin_slot_sync(self) -> None:
+        self._tray_exist_bits = None
+        self._ams_state_presence.clear()
+        self._needs_slot_sync = True
 
     def _on_disconnect(
         self, mqtt_client, client, userdata, disconnect_flags, rc, properties
     ):
         """Wird im paho-Thread aufgerufen wenn MQTT getrennt wird."""
         self._connected = False
-        self._current_slots = []  # Force full re-sync on reconnect
         logger.warning(
             f"Bambu driver disconnected from printer {self.printer_id}: {rc}"
         )
@@ -235,13 +270,15 @@ class Driver(
 
             # push_status Nachrichten verarbeiten
             if payload.get("print", {}).get("command") == "push_status":
-                self._process_slots(payload)
+                if self._loop:
+                    self._loop.call_soon_threadsafe(self._handle_slot_status, payload)
                 return
 
             # get_version / push_info: AMS Seriennummern extrahieren
             info_cmd = payload.get("info", {}).get("command", "")
             if info_cmd in ("get_version", "push_info"):
-                self._process_version_info(payload)
+                if self._loop:
+                    self._loop.call_soon_threadsafe(self._process_version_info, payload)
                 return
 
         except json.JSONDecodeError as e:
@@ -249,6 +286,14 @@ class Driver(
         except Exception as e:
             logger.error(f"Error handling MQTT message: {e}")
 
+
+    def _handle_slot_status(self, payload: dict) -> None:
+        # Keep MQTT, pending assignments and RFID results on the same event loop.
+        if self._running:
+            try:
+                self._process_slots(payload)
+            except Exception:
+                logger.exception("Error handling Bambu slot status")
 
     def _send_filament_setting(
         self, ams_id: int, tray_id: int, filament_data: dict
@@ -287,10 +332,7 @@ class Driver(
             color = "FFFFFF"  # Default weiß
 
         try:
-            mqtt_ams_id = ams_id if ams_id < 200 else 255
-            mqtt_tray_id = tray_id
-            if mqtt_ams_id == 255 and tray_id < 254:
-                mqtt_tray_id = 254
+            mqtt_ams_id, mqtt_tray_id = self._wire_tray_address(ams_id, tray_id)
             settings = {
                 "command": "ams_filament_setting",
                 "ams_id": mqtt_ams_id,
@@ -333,7 +375,6 @@ class Driver(
                 pass
             self._printer.mqtt_stop()
             self._connected = False
-            self._current_slots = []  # Force full re-sync on reconnect
             self._printer.mqtt_start()
             logger.info(f"Bambu driver reconnected for printer {self.printer_id}")
 
@@ -342,19 +383,34 @@ class Driver(
         spool_id: int | None = None,
     ) -> None:
         """Assign a FilaMan spool directly; read-only suppresses only MQTT writes."""
+        ams_id, tray_id = self._wire_tray_address(ams_id, tray_id)
         filaman_spool_id = spool_id or filament_data.get("filaman_spool_id") or filament_data.get("id")
         if filaman_spool_id:
             filaman_spool_id = int(filaman_spool_id)
             slot_index = f"{ams_id}-{tray_id}"
-            await self._update_spool_location(filaman_spool_id, ams_id, tray_id)
-            self._slot_spool_ids[slot_index] = filaman_spool_id
-            for slot in self._current_slots:
-                if slot.get("slot_index") == slot_index:
-                    slot["spool_id"] = filaman_spool_id
-                    tray_uuid = self._normalize_hex_identifier(slot.get("tray_uuid"), 32)
-                    if tray_uuid:
-                        self._spool_ids_by_tray_uuid[tray_uuid] = filaman_spool_id
-            self._emit_slots_with_spool_ids()
+            present = self._ams_reported_presence(ams_id, tray_id)
+            if present is False:
+                raise TypeError("Cannot assign a spool to an empty Bambu slot")
+            occupied = present or any(
+                slot["slot_index"] == slot_index and slot["present"]
+                for slot in self._current_slots
+            )
+            if not occupied:
+                if self._read_only:
+                    raise TypeError(
+                        "Cannot verify spool occupancy in this Bambu slot in read-only mode"
+                    )
+                self._arm_pending_spool(
+                    PendingSpool(filaman_spool_id, filament_data, slot_index, send_setting=False),
+                    self._timeout_seconds,
+                )
+            else:
+                self._slot_spool_ids[slot_index] = filaman_spool_id
+                self._explicit_slot_assignments.add(slot_index)
+                await self._sync_slot_location(slot_index, filaman_spool_id)
+                if self._slot_spool_ids.get(slot_index) != filaman_spool_id:
+                    return
+                self._emit_slots_with_spool_ids()
         self._send_filament_setting(ams_id, tray_id, filament_data)
 
     # -- Pending-Spool API ----------------------------------------------------
@@ -365,6 +421,8 @@ class Driver(
         filament_data: dict,
         slot_index: str | None = None,
         timeout_seconds: int | None = None,
+        *,
+        claim: Callable[[], bool] | None = None,
     ) -> None:
         """Spule für automatische Zuweisung vormerken.
 
@@ -373,23 +431,34 @@ class Driver(
         filament setting further down is suppressed - the same rule the RFID
         auto-import already follows.
         """
-        if self._pending and self._pending.timer:
-            self._pending.timer.cancel()
-
-        self._pending = PendingSpool(spool_id, filament_data, slot_index)
+        if claim is not None and not callable(claim):
+            raise TypeError("claim must be callable")
+        if slot_index is not None:
+            parsed_slot = self._parse_slot_index(slot_index)
+            if parsed_slot:
+                ams_id, tray_id = self._wire_tray_address(*parsed_slot)
+                slot_index = f"{ams_id}-{tray_id}"
+        pending = PendingSpool(spool_id, filament_data, slot_index, claim=claim)
         effective_timeout = (
             timeout_seconds if timeout_seconds is not None else self._timeout_seconds
         )
-        self._pending.timer = asyncio.create_task(self._timeout_task(effective_timeout))
+        self._arm_pending_spool(pending, effective_timeout)
+
+    def _arm_pending_spool(self, pending: PendingSpool, timeout: int) -> None:
+        if self._pending and self._pending.timer:
+            self._pending.timer.cancel()
+        pending.timer = asyncio.create_task(self._timeout_task(pending, timeout))
+        self._pending = pending
         logger.info(
-            f"Pending spool {spool_id} for printer {self.printer_id} (slot: {slot_index}, timeout: {effective_timeout}s)"
+            "Pending spool %s for printer %s (slot: %s, timeout: %ss)",
+            pending.spool_id, self.printer_id, pending.slot_index, timeout,
         )
 
-    async def _timeout_task(self, timeout: int | None = None) -> None:
-        """Wartet auf Timeout, dann verwirft Pending."""
-        await asyncio.sleep(timeout if timeout is not None else self._timeout_seconds)
-        if self._pending:
-            logger.info(f"Pending spool {self._pending.spool_id} timed out")
+    async def _timeout_task(self, pending: PendingSpool, timeout: int) -> None:
+        """Expire only the pending request that started this timer."""
+        await asyncio.sleep(timeout)
+        if self._pending is pending:
+            logger.info("Pending spool %s timed out", pending.spool_id)
             self._pending = None
 
     # -- Health ---------------------------------------------------------------

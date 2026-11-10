@@ -260,10 +260,10 @@ class SpoolSyncMixin:
         candidates: list[dict[str, Any]] = []
         for slot in slots:
             tray_uuid = self._normalize_hex_identifier(slot.get("tray_uuid"), 32)
-            if not tray_uuid:
+            if not tray_uuid or not slot.get("present"):
                 continue
-            last_attempt = self._auto_import_last_attempt.get(tray_uuid, 0)
-            if now - last_attempt < AUTO_IMPORT_RETRY_SECONDS:
+            last_attempt = self._auto_import_last_attempt.get(tray_uuid)
+            if last_attempt is not None and now - last_attempt < AUTO_IMPORT_RETRY_SECONDS:
                 continue
             self._auto_import_last_attempt[tray_uuid] = now
             candidates.append(dict(slot))
@@ -276,33 +276,36 @@ class SpoolSyncMixin:
         )
 
     def _schedule_slot_location_release(self, slot_index: str) -> None:
-        """Queue the location cleanup for a tray that just went empty."""
-        parsed = self._parse_slot_index(slot_index)
-        if not parsed or not self._loop:
-            return
-        ams_id, tray_id = parsed
-        self._loop.call_soon_threadsafe(
-            lambda: asyncio.create_task(
-                self._release_slot_location(ams_id, tray_id)
-            )
-        )
+        """Queue the location cleanup for an empty or replaced tray."""
+        self._schedule_slot_location_update(slot_index, None)
 
     def _schedule_slot_location_update(
-        self, slot_index: str, spool_id: int
+        self, slot_index: str, spool_id: int | None
     ) -> None:
-        """Queue a known replacement spool for its slot location."""
-        parsed = self._parse_slot_index(slot_index)
-        if not parsed or not self._loop:
-            return
-        ams_id, tray_id = parsed
-        self._loop.call_soon_threadsafe(
-            lambda: asyncio.create_task(
-                self._update_spool_location(
-                    spool_id,
-                    ams_id,
-                    tray_id,
-                )
+        """Queue reconciliation of the managed location with the tray link."""
+        if self._loop:
+            self._loop.call_soon_threadsafe(
+                lambda: asyncio.create_task(self._sync_slot_location(slot_index, spool_id))
             )
+
+    async def _sync_slot_location(self, slot_index: str, spool_id: int | None) -> None:
+        """Skip stale work and serialize writes while the database yields."""
+        parsed = self._parse_slot_index(slot_index)
+        if not parsed:
+            return
+        async with self._slot_location_lock:
+            if self._slot_spool_ids.get(slot_index) != spool_id:
+                return
+            if spool_id is None:
+                await self._release_slot_location(*parsed)
+            else:
+                await self._update_spool_location(spool_id, *parsed)
+
+    def _slot_has_rfid(self, slot_index: str, tray_uuid: str) -> bool:
+        return any(
+            slot["slot_index"] == slot_index and slot.get("present")
+            and self._normalize_hex_identifier(slot.get("tray_uuid"), 32) == tray_uuid
+            for slot in self._current_slots
         )
 
     async def _auto_import_rfid_spools(
@@ -323,7 +326,8 @@ class SpoolSyncMixin:
             for slot in slots:
                 tray_uuid = self._normalize_hex_identifier(slot.get("tray_uuid"), 32)
                 tag_uid = self._normalize_hex_identifier(slot.get("tag_uid"), 16)
-                if not tray_uuid:
+                slot_index = str(slot.get("slot_index") or "")
+                if not tray_uuid or not self._slot_has_rfid(slot_index, tray_uuid):
                     continue
 
                 external_id = f"{BAMBU_EXTERNAL_ID_PREFIX}{tray_uuid}"
@@ -342,6 +346,12 @@ class SpoolSyncMixin:
                         db, external_id, tray_uuid
                     )
 
+                    if not self._slot_has_rfid(slot_index, tray_uuid):
+                        continue
+                    if slot_index in self._explicit_slot_assignments and (
+                        spool is None or self._slot_spool_ids.get(slot_index) != spool.id
+                    ):
+                        continue
                     if spool is None:
                         if not self._auto_import_spools:
                             # Nothing known and nothing may be created, so this
@@ -375,6 +385,10 @@ class SpoolSyncMixin:
                             )
                             continue
 
+                        if slot_index in self._explicit_slot_assignments or not self._slot_has_rfid(
+                            slot_index, tray_uuid
+                        ):
+                            continue
                         custom_fields = {}
                         if tag_uid:
                             custom_fields[BAMBU_RFID_TAG_1_FIELD] = tag_uid
@@ -436,17 +450,14 @@ class SpoolSyncMixin:
                     self._spool_ids_by_tray_uuid.get(tray_uuid) != spool.id
                 )
                 self._spool_ids_by_tray_uuid[tray_uuid] = spool.id
-                slot_index = str(slot.get("slot_index") or "")
-                slot_mapping_changed = bool(slot_index) and (
-                    self._slot_spool_ids.get(slot_index) != spool.id
+                slot_mapping_changed = (
+                    slot_index not in self._explicit_slot_assignments
+                    and self._slot_has_rfid(slot_index, tray_uuid)
+                    and self._slot_spool_ids.get(slot_index) != spool.id
                 )
-                if slot_index:
+                if slot_mapping_changed:
                     self._slot_spool_ids[slot_index] = spool.id
-                parsed_slot = self._parse_slot_index(slot_index)
-                if parsed_slot and slot_mapping_changed:
-                    await self._update_spool_location(
-                        spool.id, parsed_slot[0], parsed_slot[1]
-                    )
+                    await self._sync_slot_location(slot_index, spool.id)
                 changed = (
                     changed
                     or created
@@ -536,7 +547,7 @@ class SpoolSyncMixin:
         location.custom_fields = custom_fields
 
     async def _find_slot_location(
-        self, db, ams_id: int, tray_id: int
+        self, db, ams_id: int, tray_id: int, *, adopt_by_name: bool = True
     ) -> Location | None:
         """Find the stable slot or conservatively adopt an owned legacy row."""
         identifier = self._generate_slot_location_identifier(ams_id, tray_id)
@@ -586,6 +597,9 @@ class SpoolSyncMixin:
                 ams_id,
                 tray_id,
             )
+            return None
+
+        if not adopt_by_name:
             return None
 
         name_candidates = [
@@ -670,7 +684,7 @@ class SpoolSyncMixin:
         slot_location_name = self._generate_slot_location_name(ams_id, tray_id)
         try:
             async with async_session_maker() as db:
-                location = await self._find_slot_location(db, ams_id, tray_id)
+                location = await self._find_slot_location(db, ams_id, tray_id, adopt_by_name=False)
                 if location is None:
                     return
                 await self._clear_slot_location(

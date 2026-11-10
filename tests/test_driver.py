@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from app.models import Color, Filament, FilamentColor, Manufacturer, Printer
 from app.models.base import Base
 from app.models.location import Location
+from app.models.printer import PrinterSlot
 from app.models.printer_params import FilamentPrinterParam
 from app.models.spool import Spool, SpoolStatus
 from app.models.system_extra_field import SystemExtraField
@@ -428,6 +429,319 @@ class InventoryEnrichmentCoordinatorTests(unittest.IsolatedAsyncioTestCase):
 
 
 class SlotProcessingTests(unittest.TestCase):
+    def test_clearing_material_keeps_the_slot_occupied_and_assignable(self):
+        driver, events = make_driver(printer_model="H2C")
+        driver._update_spool_location = AsyncMock()
+        driver._send_filament_setting = Mock()
+        driver._schedule_slot_location_release = Mock()
+        tray = {"id": "3", "state": 11, "tray_type": "PLA"}
+        ams = {"ams": [{"id": "0", "tray": [tray]}]}
+        driver._process_slots({"print": {"ams": {**ams, "tray_exist_bits": "bef"}}})
+        filament_data = {"material_type": "PLA"}
+        asyncio.run(driver.send_filament_to_tray(0, 3, filament_data, spool_id=17))
+
+        driver._pending = PendingSpool(99, filament_data, None)
+        tray.update(tray_type="", tray_info_idx="", tray_color="00000000")
+        del tray["state"]
+        driver._process_slots({"print": {"ams": ams}})
+
+        slot = driver.health()["slots"][0]
+        self.assertTrue(slot["present"])
+        self.assertEqual(slot["tray_type"], "")
+        self.assertEqual(slot["spool_id"], 17)
+        self.assertEqual(driver._pending.spool_id, 99)
+        driver._schedule_slot_location_release.assert_not_called()
+        driver._send_filament_setting.assert_called_once_with(0, 3, filament_data)
+
+        asyncio.run(driver.send_filament_to_tray(0, 3, filament_data, spool_id=42))
+        self.assertEqual(events[-1]["slots"][0]["spool_id"], 42)
+
+    def test_pending_spool_is_assigned_on_insertion_without_material(self):
+        for include_trays in (False, True):
+            with self.subTest(include_trays=include_trays):
+                driver, _ = make_driver(printer_model="H2C")
+                driver._send_filament_setting = Mock()
+                driver._process_slots({"print": {"ams": {
+                    "tray_exist_bits": "0",
+                    "ams": [{"id": "0", "tray": [{"id": "3", "state": 0}]}],
+                }}})
+                filament_data = {"material_type": "PETG"}
+                driver._pending = PendingSpool(17, filament_data, "0-3")
+                ams = {"tray_exist_bits": "8"}
+                if include_trays:
+                    ams["ams"] = [{"id": "0", "tray": [
+                        {"id": "3", "state": 11, "tray_type": ""},
+                    ]}]
+                driver._process_slots({"print": {"ams": ams}})
+                driver._process_slots({"print": {"ams": ams}})
+
+                slot = driver.health()["slots"][0]
+                self.assertTrue(slot["present"])
+                self.assertEqual(slot["spool_id"], 17)
+                self.assertIsNone(driver._pending)
+                driver._send_filament_setting.assert_called_once_with(0, 3, filament_data)
+
+    def test_ams_ht_presence_delta_releases_the_removed_spool(self):
+        driver, _ = make_driver(printer_model="H2D")
+        driver._schedule_slot_location_release = Mock()
+        uuid = "A" * 32
+        driver._spool_ids_by_tray_uuid[uuid] = 17
+        driver._process_slots({"print": {
+            "ams": {"tray_exist_bits": "5000b", "ams": [
+                {"id": "128", "tray": [{"id": "0", "tray_type": "PLA", "tray_uuid": uuid}]},
+                {"id": "129", "tray": [{"id": "0", "state": 10, "tray_type": "PLA"}]},
+                {"id": "130", "tray": [{"id": "0", "state": 11, "tray_type": ""}]},
+            ]},
+            "vt_tray": {"id": "254", "tray_type": "PETG"},
+        }})
+        first, second, third, external = driver.health()["slots"]
+        self.assertEqual(first["spool_id"], 17)
+        self.assertFalse(second["present"])
+        self.assertTrue(third["present"])
+        driver._schedule_slot_location_release.reset_mock()
+
+        driver._process_slots({"print": {"ams": {"tray_exist_bits": "4000b"}}})
+        removed, _, _, after = driver.health()["slots"]
+        self.assertFalse(removed["present"])
+        self.assertIsNone(removed["spool_id"])
+        self.assertFalse(removed.get("tray_type"))
+        self.assertEqual(after, external)
+        driver._schedule_slot_location_release.assert_called_once_with("128-0")
+
+        driver._process_slots({"print": {"ams": {"tray_exist_bits": "5000b"}}})
+        reinserted = driver.health()["slots"][0]
+        self.assertTrue(reinserted["present"])
+        self.assertIsNone(reinserted.get("spool_id"))
+
+    def test_ams_presence_falls_back_to_state_then_material(self):
+        driver, _ = make_driver()
+        driver._process_slots({"print": {"ams": {
+            "tray_exist_bits": "invalid",
+            "ams": [{"id": "0", "tray": [
+                {"id": "0", "state": 11, "tray_type": ""},
+                {"id": "1", "state": "10", "tray_type": "PLA"},
+                {"id": "2", "tray_type": "PLA"},
+                {"id": "3"},
+            ]}],
+        }}})
+        self.assertEqual(
+            [slot["present"] for slot in driver.health()["slots"]],
+            [True, False, True, False],
+        )
+
+    def test_p2s_shutdown_preserves_loaded_slots_but_real_zero_mask_releases_them(self):
+        for model, powered, releases in (
+            ("P2S", False, False), ("P2S", True, True), ("X1C", False, True),
+        ):
+            with self.subTest(model=model, powered=powered):
+                driver, _ = make_driver(printer_model=model)
+                driver._schedule_slot_location_release = Mock()
+                driver._process_slots({"print": {"ams": {
+                    "tray_exist_bits": "1",
+                    "ams": [{"id": "0", "tray": [{"id": "0", "tray_type": "PLA"}]}],
+                }}})
+                driver._slot_spool_ids["0-0"] = 17
+                driver._process_slots({"print": {"ams": {
+                    "tray_exist_bits": "0", "power_on_flag": powered,
+                }}})
+
+                slot = driver.health()["slots"][0]
+                self.assertEqual(slot["present"], not releases)
+                self.assertEqual(driver._schedule_slot_location_release.called, releases)
+
+    def test_p2s_shutdown_mask_only_reconciles_individually_confirmed_empty_trays(self):
+        driver, events = make_driver(printer_model="P2S")
+        released = []
+        driver._schedule_slot_location_release = released.append
+        driver._process_slots({"print": {"ams": {
+            "ams_exist_bits": "1", "tray_exist_bits": "3",
+            "ams": [{"id": "0", "tray": [
+                {"id": "0", "state": 11, "tray_type": "PLA"},
+                {"id": "1", "state": 11, "tray_type": "PETG"},
+            ]}],
+        }}})
+        driver._process_slots({"print": {"ams": {
+            "ams_exist_bits": "0", "tray_exist_bits": "0", "power_on_flag": False,
+            "ams": [{"id": "0", "tray": [
+                {"id": "0", "tray_type": ""}, {"id": "1", "state": 8},
+            ]}],
+        }}})
+        self.assertEqual([slot["present"] for slot in events[-1]["slots"]], [True, False])
+        self.assertEqual(driver.health()["ams_count"], 1)
+        self.assertEqual(released, ["0-1"])
+
+        driver._process_slots({"print": {"ams": {
+            "tray_exist_bits": "0", "power_on_flag": False,
+            "ams": [{"id": "0", "tray": [{"id": "0", "state": 8}]}],
+        }}})
+        self.assertEqual([slot["present"] for slot in events[-1]["slots"]], [False, False])
+        self.assertEqual(released, ["0-1", "0-0"])
+
+    def test_valid_topology_mask_retires_four_bay_and_ht_units_once(self):
+        for update in ([], [{"id": "0", "tray": [{"id": "0", "remain": 55}]}]):
+            with self.subTest(update=update):
+                driver, events = make_driver()
+                released = []
+                driver._schedule_slot_location_release = released.append
+                driver._process_slots({"print": {"ams": {
+                    "ams_exist_bits": "13", "tray_exist_bits": "10011",
+                    "ams": [
+                        {"id": "0", "tray": [{"id": "0", "tray_type": "PLA"}]},
+                        {"id": "1", "tray": [{"id": "0", "tray_type": "PETG"}]},
+                        {"id": "128", "tray": [{"id": "0", "tray_type": "ASA"}]},
+                    ],
+                }}})
+                driver._process_slots({"print": {"ams": {
+                    "ams_exist_bits": "invalid", "ams": update,
+                }}})
+                self.assertEqual(driver.health()["ams_count"], 3)
+
+                topology = {"ams_exist_bits": "1", "ams": update}
+                driver._process_slots({"print": {"ams": topology}})
+                health = driver.health()
+                self.assertEqual(health["ams_count"], 1)
+                self.assertEqual([slot["slot_index"] for slot in health["slots"]], ["0-0"])
+                retired = [slot for slot in events[-1]["slots"] if slot.get("is_active") is False]
+                self.assertEqual([slot["slot_index"] for slot in retired], ["1-0", "128-0"])
+                self.assertTrue(all(not slot["present"] and slot["spool_id"] is None for slot in retired))
+                self.assertEqual(released, ["1-0", "128-0"])
+                event_count = len(events)
+                driver._process_slots({"print": {"ams": topology}})
+                self.assertEqual(len(events), event_count)
+                self.assertEqual(released, ["1-0", "128-0"])
+
+                driver._process_slots({"print": {"ams": {
+                    "ams_exist_bits": "11", "tray_exist_bits": "10001",
+                    "ams": [{"id": "128", "tray": [{"id": "0", "tray_type": "ASA"}]}],
+                }}})
+                self.assertEqual([slot["slot_index"] for slot in driver.health()["slots"]], ["0-0", "128-0"])
+                self.assertTrue(events[-1]["slots"][-1]["present"])
+
+    def test_replugged_unit_does_not_inherit_the_pre_replug_occupancy_mask(self):
+        for retirement in ({}, {"tray_exist_bits": "1"}):
+            with self.subTest(retirement=retirement):
+                driver, _ = make_driver()
+                driver._process_slots({"print": {"ams": {
+                    "ams_exist_bits": "3", "tray_exist_bits": "11",
+                    "ams": [
+                        {"id": "0", "tray": [{"id": "0", "tray_type": "PLA"}]},
+                        {"id": "1", "tray": [{"id": "0", "tray_type": "PETG"}]},
+                    ],
+                }}})
+                driver._process_slots({"print": {"ams": {"ams_exist_bits": "1", **retirement}}})
+                driver._process_slots({"print": {"ams": {"ams": [
+                    {"id": "1", "tray": [{"id": "0", "state": 8}]},
+                ]}}})
+                self.assertEqual([slot["present"] for slot in driver.health()["slots"]], [True, False])
+
+                driver._process_slots({"print": {"ams": {"ams_exist_bits": "1", "tray_exist_bits": "1"}}})
+                driver._process_slots({"print": {"ams": {"tray_exist_bits": "1"}}})
+                driver._process_slots({"print": {"ams": {"ams": [
+                    {"id": "1", "tray": [{"id": "0", "state": 9}]},
+                ]}}})
+                self.assertEqual([slot["present"] for slot in driver.health()["slots"]], [True, True])
+
+                driver._process_slots({"print": {"ams": {"ams_exist_bits": "1"}}})
+                driver._process_slots({"print": {"ams": {"ams_exist_bits": "3", "tray_exist_bits": "11"}}})
+                driver._process_slots({"print": {"ams": {"ams": [
+                    {"id": "1", "tray": [{"id": "0", "state": 8}]},
+                ]}}})
+                self.assertEqual([slot["present"] for slot in driver.health()["slots"]], [True, True])
+
+    def test_partial_ams_update_merges_units_and_trays_and_applies_global_mask(self):
+        driver, _ = make_driver()
+        released = []
+        driver._schedule_slot_location_release = released.append
+        uuid = "A" * 32
+        driver._spool_ids_by_tray_uuid[uuid] = 17
+        driver._process_slots({"print": {"ams": {
+            "tray_exist_bits": "13",
+            "ams": [
+                {"id": "0", "humidity": "3", "tray": [
+                    {"id": "0", "tray_type": "PLA", "tray_uuid": uuid},
+                    {"id": "1", "tray_type": "PETG"},
+                ]},
+                {"id": "1", "info": "3", "tray": [{"id": "0", "tray_type": "ASA"}]},
+            ],
+        }}})
+        driver._process_slots({"print": {"ams": {
+            "tray_exist_bits": "3",
+            "ams": [{"id": "0", "tray": [{"id": "0", "remain": 45}]}],
+        }}})
+
+        health = driver.health()
+        self.assertEqual(len(health["slots"]), 3)
+        first, second, third = health["slots"]
+        self.assertEqual((first["tray_type"], first["remain"], first["spool_id"]), ("PLA", 45, 17))
+        self.assertEqual(second["tray_type"], "PETG")
+        self.assertFalse(third["present"])
+        self.assertFalse(third.get("tray_uuid"))
+        self.assertEqual(released, ["1-0"])
+        units = health["ams_units"]
+        self.assertEqual([(u["ams_id"], u["tray_count"]) for u in units], [(0, 2), (1, 1)])
+        self.assertEqual(units[0]["humidity"], "3")
+        self.assertEqual(units[1]["info"], "3")
+
+    def test_p2s_state_fallback_distinguishes_empty_from_unconfigured(self):
+        driver, _ = make_driver(printer_model="P2S")
+        driver._process_slots({"print": {"ams": {"ams": [{"id": "0", "tray": [
+            {"id": "0", "state": 8, "tray_type": "PLA"},
+            {"id": "1", "state": "9"},
+            {"id": "2", "state": 999, "tray_type": "PETG"},
+            {"id": "3", "state": 3},
+        ]}]}}})
+        self.assertEqual([slot["present"] for slot in driver.health()["slots"]], [False, True, True, True])
+
+    def test_pending_waits_through_material_echo_and_calibration(self):
+        driver, _ = make_driver()
+        driver._send_filament_setting = Mock()
+        driver._process_slots({"print": {"ams": {
+            "tray_exist_bits": "1", "ams": [{"id": "0", "tray": [{"id": "0", "state": 9}]}],
+        }}})
+        driver._pending = PendingSpool(17, {"material_type": "PETG"})
+        driver._process_slots({"print": {"ams": {"ams": [{"id": "0", "tray": [
+            {"id": "0", "state": 11, "tray_type": "PLA"},
+        ]}]}}})
+        driver._process_slots({"print": {"ams": {"ams": [{"id": "0", "tray": [
+            {"id": "0", "cali_idx": 4},
+        ]}]}}})
+        self.assertTrue(driver.health()["pending"])
+        driver._send_filament_setting.assert_not_called()
+
+    def test_confirmed_uuid_swap_consumes_pending_before_legacy_metadata_change(self):
+        driver, _ = make_driver()
+        driver._send_filament_setting = Mock()
+        trays = [{"id": "0", "tray_type": "PLA", "tray_uuid": "A" * 32}]
+        ams = {"tray_exist_bits": "1", "ams": [{"id": "0", "tray": trays}]}
+        external = {"id": "254", "tray_type": "PLA"}
+        driver._process_slots({"print": {"ams": ams, "vt_tray": external}})
+        driver._pending = PendingSpool(17, {"material_type": "PETG"})
+        # Clearing the printer profile can temporarily blank its UUID too.
+        trays[0].update(tray_type="", tray_uuid="0" * 32)
+        driver._process_slots({"print": {"ams": ams}})
+        trays[0].update(tray_type="PLA", tray_uuid="B" * 32)
+        driver._process_slots({"print": {"ams": ams, "vt_tray": {**external, "tray_type": "ASA"}}})
+        self.assertFalse(driver.health()["pending"])
+        driver._send_filament_setting.assert_called_once_with(0, 0, {"material_type": "PETG"})
+        self.assertEqual(driver.health()["slots"][0]["spool_id"], 17)
+
+    def test_pending_precedes_later_rfid_until_removal(self):
+        driver, _ = make_driver(read_only=True)
+        uuid = "A" * 32
+        driver._spool_ids_by_tray_uuid[uuid] = 99
+        ams = {"ams": [{"id": "0", "tray": [{"id": "0", "state": 8}]}]}
+        driver._process_slots({"print": {"ams": ams}})
+        driver._pending = PendingSpool(17, {"material_type": "PETG"})
+        driver._process_slots({"print": {"ams": {"tray_exist_bits": "1"}}})
+        ams["ams"][0]["tray"][0].update(state=11, tray_uuid=uuid, tray_type="PLA")
+        driver._process_slots({"print": {"ams": ams}})
+        driver._emit_slots_with_spool_ids()
+        self.assertEqual(driver.health()["slots"][0]["spool_id"], 17)
+
+        driver._process_slots({"print": {"ams": {"tray_exist_bits": "0"}}})
+        driver._process_slots({"print": {"ams": {**ams, "tray_exist_bits": "1"}}})
+        self.assertEqual(driver.health()["slots"][0]["spool_id"], 99)
+
     def test_retains_bambu_rfid_identifiers_in_slot_state(self):
         driver, _ = make_driver(auto_import_spools=False)
         driver._process_slots(
@@ -513,10 +827,8 @@ class SlotProcessingTests(unittest.TestCase):
         slot = driver._current_slots[0]
         self.assertEqual(slot["spool_id"], 17)
         self.assertEqual(driver._slot_spool_ids["0-0"], 17)
-        self.assertEqual(
-            driver._spool_ids_by_tray_uuid["B94E172402D14E4AB97571340E303DBA"],
-            17,
-        )
+        driver._emit_slots_with_spool_ids()
+        self.assertEqual(driver.health()["slots"][0]["spool_id"], 17)
         self.assertIsNone(driver._pending)
 
     def test_pending_spool_without_a_tray_uuid_still_lands_in_the_slot(self):
@@ -592,16 +904,14 @@ class SlotProcessingTests(unittest.TestCase):
         uuid = "A" * 32
         for cached in (False, True):
             with self.subTest(cached=cached):
-                driver, _ = make_driver()
-                driver._loop = Mock()
+                driver, events = make_driver()
                 if cached:
                     driver._slot_spool_ids["0-0"] = 42
                     driver._spool_ids_by_tray_uuid[uuid] = 42
                 driver._process_slots({"print": {"ams": {"ams": [{
                     "id": "0", "tray": [{"id": "0", "tray_type": "", "tray_uuid": uuid}],
                 }]}}})
-                payload = driver._loop.call_soon_threadsafe.call_args.args[1]
-                self.assertIsNone(payload["slots"][0]["spool_id"])
+                self.assertIsNone(events[-1]["slots"][0]["spool_id"])
                 self.assertNotIn("0-0", driver._slot_spool_ids)
 
     def test_reemit_clears_empty_slot_but_keeps_manual_non_bambu_assignment(self):
@@ -885,6 +1195,11 @@ class FilamentSettingTests(unittest.TestCase):
                     "nozzle_temp_max": 230, "tray_type": "PLA", "tray_color": "FFFFFFFF",
                 })
 
+    def test_second_external_tray_uses_the_second_wire_address(self):
+        self.driver._do_send_filament_setting(255, 1, {})
+        payload = json.loads(self.client.publish.call_args.args[1])["print"]
+        self.assertEqual((payload["ams_id"], payload["tray_id"]), (255, 255))
+
     def test_disconnected_or_read_only_never_publishes(self):
         for read_only, connected in ((True, True), (False, False)):
             with self.subTest(read_only=read_only, connected=connected):
@@ -926,6 +1241,106 @@ class ReadOnlyTests(unittest.IsolatedAsyncioTestCase):
         driver._printer = object()
         dispatched = driver._send_filament_setting(0, 0, {"material_type": "PLA"})
         self.assertFalse(dispatched)
+
+    async def test_reconnect_reports_removal_from_mask_without_repeating_trays(self):
+        driver, events = make_driver(printer_model="P2S")
+        driver._loop = asyncio.get_running_loop()
+        driver._schedule_slot_location_release = Mock()
+
+        def report(ams):
+            message = Mock(topic="device/serial/report")
+            message.payload = json.dumps({"print": {"command": "push_status", "ams": ams}}).encode()
+            driver._on_message(None, None, None, message)
+
+        driver._on_connect(None, None, None, None, 0, None)
+        report({
+            "tray_exist_bits": "1",
+            "ams": [{"id": "0", "tray": [{"id": "0", "tray_type": "PLA"}]}],
+        })
+        await asyncio.sleep(0)
+        self.assertTrue(events[-1]["slots"][0]["present"])
+
+        report({"tray_exist_bits": "0", "power_on_flag": False})
+        driver._on_disconnect(None, None, None, None, 0, None)
+        driver._on_connect(None, None, None, None, 0, None)
+        report({"tray_exist_bits": "0", "power_on_flag": True})
+        await asyncio.sleep(0)
+
+        self.assertFalse(events[-1]["slots"][0]["present"])
+        self.assertIsNone(events[-1]["slots"][0]["spool_id"])
+        driver._schedule_slot_location_release.assert_called_once_with("0-0")
+
+    async def test_direct_assignment_accepts_canonical_and_wire_external_addresses(self):
+        driver, _ = make_driver(read_only=True)
+        driver._process_slots({"print": {"vir_slot": [
+            {"id": "254", "tray_type": "PLA"}, {"id": "255", "tray_type": "PETG"},
+        ]}})
+        driver._update_spool_location = AsyncMock()
+        for canonical, wire, spool_id in ((0, 254, 17), (1, 255, 18), (255, 255, 19)):
+            await driver.send_filament_to_tray(255, canonical, {}, spool_id=spool_id)
+            driver._update_spool_location.assert_awaited_with(spool_id, 255, wire)
+        self.assertEqual([slot["spool_id"] for slot in driver.health()["slots"]], [17, 19])
+
+    async def test_external_alias_reports_match_targeted_pending_and_wire_addresses(self):
+        driver, _ = make_driver(read_only=True)
+        driver._process_slots({"print": {"vir_slot": [{"id": "1", "tray_type": ""}]}})
+        await driver.assign_pending_spool(42, {"material_type": "PLA"}, slot_index="255-1")
+        driver._process_slots({"print": {"vir_slot": [{"id": "255", "tray_type": "PLA"}]}})
+        self.assertEqual(driver.health()["slots"][0]["slot_index"], "255-255")
+        self.assertEqual(driver.health()["slots"][0]["spool_id"], 42)
+
+    async def test_direct_link_to_confirmed_empty_slot_cannot_move_inventory(self):
+        driver, _ = make_driver(read_only=True)
+        driver._update_spool_location = AsyncMock()
+        driver._process_slots({"print": {"ams": {
+            "tray_exist_bits": "0", "ams": [{"id": "0", "tray": [{"id": "0"}]}],
+        }}})
+        with self.assertRaisesRegex(TypeError, "empty"):
+            await driver.send_filament_to_tray(0, 0, {}, spool_id=42)
+        driver._update_spool_location.assert_not_awaited()
+        self.assertIsNone(driver.health()["slots"][0]["spool_id"])
+
+    async def test_direct_link_to_unverified_external_waits_for_feedback(self):
+        driver, _ = make_driver()
+        driver._update_spool_location = AsyncMock()
+        driver._schedule_slot_location_update = Mock()
+        driver._send_filament_setting = Mock()
+        driver._process_slots({"print": {"vir_slot": [{"id": "255", "tray_type": ""}]}})
+        filament = {"material_type": "PLA"}
+
+        await driver.send_filament_to_tray(255, 1, filament, spool_id=42)
+        driver._update_spool_location.assert_not_awaited()
+        self.assertIsNone(driver.health()["slots"][0]["spool_id"])
+
+        driver._process_slots({"print": {"vir_slot": [{"id": "255", "tray_type": "PLA"}]}})
+        self.assertEqual(driver.health()["slots"][0]["spool_id"], 42)
+        driver._schedule_slot_location_update.assert_called_once_with("255-255", 42)
+        driver._send_filament_setting.assert_called_once_with(255, 255, filament)
+
+    async def test_read_only_direct_link_cannot_verify_blank_external(self):
+        driver, _ = make_driver(read_only=True)
+        driver._update_spool_location = AsyncMock()
+        driver._process_slots({"print": {"vt_tray": {"id": "254", "tray_type": ""}}})
+        with self.assertRaisesRegex(TypeError, "read-only"):
+            await driver.send_filament_to_tray(255, 0, {}, spool_id=42)
+        driver._update_spool_location.assert_not_awaited()
+
+    async def test_failed_claim_drops_pending_before_sending_or_linking(self):
+        driver, _ = make_driver()
+        driver._send_filament_setting = Mock()
+        driver._schedule_slot_location_update = Mock()
+        driver._process_slots({"print": {"ams": {
+            "tray_exist_bits": "0", "ams": [{"id": "0", "tray": [{"id": "0"}]}],
+        }}})
+        driver._schedule_slot_location_update.reset_mock()
+        claim = Mock(return_value=False)
+        await driver.assign_pending_spool(42, {"material_type": "PLA"}, claim=claim)
+        driver._process_slots({"print": {"ams": {"tray_exist_bits": "1"}}})
+        self.assertFalse(driver.health()["pending"])
+        self.assertIsNone(driver.health()["slots"][0].get("spool_id"))
+        claim.assert_called_once_with()
+        driver._send_filament_setting.assert_not_called()
+        driver._schedule_slot_location_update.assert_not_called()
 
     async def test_read_only_keeps_the_assignment_but_sends_nothing(self):
         """Read-only is about the printer, not about FilaMan's own records."""
@@ -1293,6 +1708,187 @@ class AutoImportDatabaseTests(unittest.IsolatedAsyncioTestCase):
             spool = await db.get(Spool, spool_id)
         self.assertIsNone(spool.location_id)
 
+    async def test_initial_topology_retires_a_saved_ams_slot_without_inventing_live_slots(self):
+        spool_id = await self._spool_carrying({})
+        await self.driver._update_spool_location(spool_id, 128, 0)
+        async with self.sessions() as db:
+            db.add_all([
+                PrinterSlot(
+                    printer_id=1, slot_no=number, name=name, is_active=active,
+                    custom_fields={"slot_index": index},
+                )
+                for number, name, index, active in (
+                    (1, "Still connected", "0-1", True),
+                    (2, "Detached AMS HT", "128-0", True),
+                    (3, "External", "255-254", True),
+                    (4, "Tool", "16-0", True),
+                    (5, "Already inactive", "1-3", False),
+                )
+            ])
+            await db.commit()
+
+        fresh, events = make_driver()
+        fresh._ensure_shared_extra_fields = AsyncMock()
+        with patch("bambulabs_api.Printer"):
+            await fresh.start()
+        self.assertEqual(fresh.health()["slots"], [])
+        self.assertEqual(events, [])
+
+        status = {"print": {"ams": {"ams_exist_bits": "1"}}}
+        fresh._process_slots(status)
+        fresh._process_slots(status)
+        await asyncio.sleep(0)
+        await asyncio.gather(*(asyncio.all_tasks() - {asyncio.current_task()}))
+
+        self.assertEqual(fresh.health()["slots"], [])
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["slots"], [{
+            "slot_index": "128-0", "slot_name": "Detached AMS HT",
+            "present": False, "is_active": False, "spool_id": None,
+        }])
+        async with self.sessions() as db:
+            spool = await db.get(Spool, spool_id)
+            self.assertIsNone(spool.location_id)
+
+    async def test_first_empty_report_releases_a_persisted_managed_location(self):
+        spool_id = await self._spool_carrying({})
+        await self.driver._update_spool_location(spool_id, 0, 0)
+        fresh, _ = make_driver()
+        fresh._loop = asyncio.get_running_loop()
+        fresh._process_slots({"print": {"ams": {
+            "tray_exist_bits": "0", "ams": [{"id": "0", "tray": [{"id": "0"}]}],
+        }}})
+        # Join work submitted by the synchronous MQTT status handler.
+        await asyncio.sleep(0)
+        pending = asyncio.all_tasks() - {asyncio.current_task()}
+        if pending:
+            await asyncio.gather(*pending)
+        async with self.sessions() as db:
+            spool = await db.get(Spool, spool_id)
+            self.assertIsNone(spool.location_id)
+
+    async def test_delayed_rfid_lookup_cannot_relink_a_removed_tray(self):
+        spool_id = await self._spool_carrying({"tag": self.slot["tray_uuid"]})
+        self.driver._schedule_auto_import = Mock()
+        original_find = self.driver._find_existing_bambu_spool
+
+        async def find_after_removal(*args):
+            self.driver._process_slots({"print": {"ams": {"tray_exist_bits": "0"}}})
+            return await original_find(*args)
+
+        self.driver._find_existing_bambu_spool = find_after_removal
+        await self.driver._auto_import_rfid_spools([self.slot])
+        await asyncio.sleep(0)
+        pending = asyncio.all_tasks() - {asyncio.current_task()}
+        if pending:
+            await asyncio.gather(*pending)
+        self.assertIsNone(self.driver.health()["slots"][0]["spool_id"])
+        async with self.sessions() as db:
+            spool = await db.get(Spool, spool_id)
+            self.assertIsNone(spool.location_id)
+
+    async def test_inflight_release_cannot_undo_a_new_slot_assignment(self):
+        old_spool = await self._spool_carrying({})
+        new_spool = await self._spool_carrying({})
+        await self.driver._update_spool_location(old_spool, 0, 0)
+        self.driver._schedule_auto_import = Mock()
+
+        release_started = asyncio.Event()
+        finish_release = asyncio.Event()
+        update_started = asyncio.Event()
+        original_release = self.driver._release_slot_location
+        original_update = self.driver._update_spool_location
+
+        async def paused_release(*args):
+            release_started.set()
+            await finish_release.wait()
+            await original_release(*args)
+
+        async def update(*args):
+            update_started.set()
+            await original_update(*args)
+
+        self.driver._release_slot_location = paused_release
+        self.driver._update_spool_location = update
+        self.driver._process_slots({"print": {"ams": {"tray_exist_bits": "0"}}})
+        await asyncio.wait_for(release_started.wait(), timeout=1)
+
+        self.driver._pending = PendingSpool(new_spool, {"material_type": "PLA"})
+        self.driver._send_filament_setting = Mock()
+        self.driver._process_slots({"print": {"ams": {"tray_exist_bits": "1"}}})
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        update_ran_early = update_started.is_set()
+        finish_release.set()
+
+        await asyncio.gather(*(asyncio.all_tasks() - {asyncio.current_task()}))
+        self.assertFalse(update_ran_early)
+        async with self.sessions() as db:
+            location = await db.scalar(select(Location).where(Location.identifier == "bambulab_1_0_0"))
+            self.assertIsNone((await db.get(Spool, old_spool)).location_id)
+            self.assertEqual((await db.get(Spool, new_spool)).location_id, location.id)
+
+    async def test_inflight_rfid_cannot_replace_an_explicit_pending_assignment(self):
+        uuid = self.slot["tray_uuid"]
+        rfid_spool = await self._spool_carrying({"tag": uuid})
+        assigned_spool = await self._spool_carrying({})
+        self.driver._schedule_auto_import = Mock()
+        self.driver._send_filament_setting = Mock()
+        original_find = self.driver._find_existing_bambu_spool
+
+        async def find_after_assignment(*args):
+            self.driver._process_slots({"print": {"ams": {"tray_exist_bits": "0"}}})
+            self.driver._pending = PendingSpool(assigned_spool, {"material_type": "PLA"})
+            self.driver._process_slots({"print": {"ams": {"tray_exist_bits": "1"}}})
+            self.driver._process_slots({"print": {"ams": {"ams": [
+                {"id": "0", "tray": [{"id": "0", "tray_uuid": uuid, "tray_type": "PLA"}]},
+            ]}}})
+            return await original_find(*args)
+
+        self.driver._find_existing_bambu_spool = find_after_assignment
+        await self.driver._auto_import_rfid_spools([self.slot])
+        await asyncio.sleep(0)
+        await asyncio.gather(*(asyncio.all_tasks() - {asyncio.current_task()}))
+        self.assertEqual(self.driver.health()["slots"][0]["spool_id"], assigned_spool)
+        async with self.sessions() as db:
+            self.assertIsNone((await db.get(Spool, rfid_spool)).location_id)
+            self.assertIsNotNone((await db.get(Spool, assigned_spool)).location_id)
+
+    async def test_late_cached_rfid_after_reinsertion_restores_the_managed_location(self):
+        uuid = self.slot["tray_uuid"]
+        spool_id = await self._spool_carrying({"tag": uuid})
+        self.driver._schedule_auto_import = Mock()
+        await self.driver._auto_import_rfid_spools([self.slot])
+        self.driver._process_slots({"print": {"ams": {"tray_exist_bits": "0"}}})
+        await asyncio.sleep(0)
+        await asyncio.gather(*(asyncio.all_tasks() - {asyncio.current_task()}))
+        self.driver._process_slots({"print": {"ams": {"tray_exist_bits": "1"}}})
+        self.driver._process_slots({"print": {"ams": {"ams": [
+            {"id": "0", "tray": [{"id": "0", "tray_uuid": uuid, "tray_type": "PLA"}]},
+        ]}}})
+        await asyncio.sleep(0)
+        await asyncio.gather(*(asyncio.all_tasks() - {asyncio.current_task()}))
+
+        self.assertEqual(self.driver.health()["slots"][0]["spool_id"], spool_id)
+        async with self.sessions() as db:
+            spool = await db.get(Spool, spool_id)
+            self.assertIsNotNone(spool.location_id)
+
+    async def test_removal_during_filament_lookup_prevents_stale_rfid_import(self):
+        self.driver._schedule_auto_import = Mock()
+        original_match = self.driver._find_matching_filament
+
+        async def find_after_removal(*args):
+            self.driver._process_slots({"print": {"ams": {"tray_exist_bits": "0"}}})
+            return await original_match(*args)
+
+        self.driver._find_matching_filament = find_after_removal
+        await self.driver._auto_import_rfid_spools([self.slot])
+        await asyncio.sleep(0)
+        await asyncio.gather(*(asyncio.all_tasks() - {asyncio.current_task()}))
+        async with self.sessions() as db:
+            self.assertEqual(await db.scalar(select(func.count()).select_from(Spool)), 0)
+
     async def test_printer_rename_reuses_the_stable_slot_location(self):
         """A display-name change must not create a second physical slot."""
         spool_id = await self._spool_carrying({})
@@ -1515,14 +2111,9 @@ class AutoImportDatabaseTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_physical_tag_uid_is_not_used_as_spool_identity(self):
         await self.driver._auto_import_rfid_spools([self.slot])
-        await self.driver._auto_import_rfid_spools(
-            [
-                {
-                    **self.slot,
-                    "tray_uuid": "11223344556677881122334455667788",
-                }
-            ]
-        )
+        replacement = {**self.slot, "tray_uuid": "11223344556677881122334455667788"}
+        self.driver._current_slots = [replacement]
+        await self.driver._auto_import_rfid_spools([replacement])
 
         async with self.sessions() as db:
             spools = list(
@@ -2039,6 +2630,7 @@ class AutoImportDatabaseTests(unittest.IsolatedAsyncioTestCase):
             "tag_uid": "8899AABBCCDDEEFF",
             "tray_uuid": "11223344556677881122334455667788",
         }
+        self.driver._current_slots = [unknown]
         await self.driver._auto_import_rfid_spools([unknown])
 
         async with self.sessions() as db:
