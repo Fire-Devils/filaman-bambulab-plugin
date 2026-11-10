@@ -528,6 +528,51 @@ class SlotProcessingTests(unittest.TestCase):
             [True, False, True, False],
         )
 
+    def test_first_metadata_only_report_waits_for_presence_before_reporting_slot(self):
+        for tray_bits in ("0", "1"):
+            with self.subTest(tray_bits=tray_bits):
+                driver, events = make_driver()
+                driver._schedule_slot_location_release = Mock()
+                driver._process_slots({"print": {"ams": {"ams": [
+                    {"id": "0", "tray": [{"id": "0", "remain": 55}]},
+                ]}}})
+                self.assertEqual(driver.health()["slots"], [])
+                self.assertTrue(all(not event["slots"] for event in events))
+                driver._schedule_slot_location_release.assert_not_called()
+
+                driver._process_slots({"print": {"ams": {"tray_exist_bits": tray_bits}}})
+                slot = driver.health()["slots"][0]
+                self.assertEqual(slot["present"], tray_bits == "1")
+                if tray_bits == "1":
+                    self.assertEqual(slot["remain"], 55)
+                    self.assertNotIn("spool_id", slot)
+                    driver._schedule_slot_location_release.assert_not_called()
+                else:
+                    self.assertIsNone(slot["spool_id"])
+                    driver._schedule_slot_location_release.assert_called_once_with("0-0")
+
+    def test_startup_metadata_does_not_cross_unverified_spool_identities(self):
+        for next_report in ("confirmed", "unverified", "after_blank_uuid"):
+            with self.subTest(next_report=next_report):
+                driver, _ = make_driver()
+                trays = [{"id": "0", "tray_uuid": "A" * 32, "tray_weight": 1000, "remain": 88}]
+                ams = {"ams": [{"id": "0", "tray": trays}]}
+                driver._process_slots({"print": {"ams": ams}})
+
+                if next_report == "after_blank_uuid":
+                    trays[0] = {"id": "0", "tray_uuid": "0" * 32}
+                    driver._process_slots({"print": {"ams": ams}})
+                trays[0] = {"id": "0", "tray_uuid": "B" * 32}
+                if next_report != "unverified":
+                    trays[0]["tray_type"] = "PLA"
+                driver._process_slots({"print": {"ams": ams}})
+                driver._process_slots({"print": {"ams": {"tray_exist_bits": "1"}}})
+
+                slot = driver.health()["slots"][0]
+                self.assertEqual(slot["tray_uuid"], "B" * 32)
+                self.assertIsNone(slot["remain"])
+                self.assertIsNone(slot["tray_weight"])
+
     def test_legacy_id_only_removal_overrides_cached_tray_state(self):
         driver, _ = make_driver()
         driver._schedule_slot_location_release = Mock()
@@ -1355,6 +1400,24 @@ class ReadOnlyTests(unittest.IsolatedAsyncioTestCase):
                 report({"id": "0", "state": 8})
                 self.assertFalse(driver.health()["slots"][0]["present"])
                 driver._schedule_slot_location_release.assert_called_once_with("0-0")
+
+    async def test_reconnect_does_not_consume_scan_on_empty_tray_profile(self):
+        driver, _ = make_driver()
+        driver._send_filament_setting = Mock()
+        ams = {"ams": [{"id": "0", "tray": [{"id": "0", "tray_type": "PLA"}]}]}
+        driver._process_slots({"print": {"ams": {**ams, "tray_exist_bits": "0"}}})
+        filament = {"material_type": "PETG"}
+        await driver.assign_pending_spool(17, filament)
+
+        driver._begin_slot_sync()
+        driver._process_slots({"print": {"ams": ams}})
+        self.assertFalse(driver.health()["slots"][0]["present"])
+        self.assertTrue(driver.health()["pending"])
+        driver._send_filament_setting.assert_not_called()
+
+        driver._process_slots({"print": {"ams": {"tray_exist_bits": "1"}}})
+        self.assertEqual(driver.health()["slots"][0]["spool_id"], 17)
+        driver._send_filament_setting.assert_called_once_with(0, 0, filament)
 
     async def test_reconnect_reports_removal_from_mask_without_repeating_trays(self):
         driver, events = make_driver(printer_model="P2S")

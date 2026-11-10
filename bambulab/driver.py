@@ -78,6 +78,7 @@ class Driver(
         self._tray_exist_bits: int | None = None
         self._ams_units_awaiting_occupancy: set[int] = set()
         self._ams_state_presence: dict[str, bool] = {}
+        self._unverified_ams_trays: dict[str, dict] = {}
         self._confirmed_tray_uuids: dict[str, str] = {}
         self._needs_slot_sync = False
         self._printer_model = config.get("printer_model", "P1S")
@@ -252,15 +253,18 @@ class Driver(
         self.log_debug("event", "mqtt", {"event": "connected", "rc": str(rc)})
 
     def _begin_slot_sync(self) -> None:
-        # Keep confirmed loads until a fresh mask or state can prove removal.
-        occupied = {}
+        # Keep confirmed occupancy until a fresh mask or tray state replaces it.
+        last_presence = {}
         for slot in self._current_slots:
             sid = slot["slot_index"]
             address = self._parse_slot_index(sid)
-            if address and self._ams_reported_presence(*address) is True:
-                occupied[sid] = True
+            if address:
+                present = self._ams_reported_presence(*address)
+                if present is not None:
+                    last_presence[sid] = present
         self._tray_exist_bits = None
-        self._ams_state_presence = occupied
+        self._ams_state_presence = last_presence
+        self._unverified_ams_trays.clear()
         self._needs_slot_sync = True
 
     def _on_disconnect(
