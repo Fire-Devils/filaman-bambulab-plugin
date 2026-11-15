@@ -1,5 +1,6 @@
-import importlib
 import asyncio
+import importlib
+import importlib.util
 import json
 import unittest
 from pathlib import Path
@@ -2294,9 +2295,6 @@ class PrinterNameTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(order, [("name", None), ("mqtt", "X1C")])
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 X1C_PUSH_STATUS = {
     "print": {
@@ -2333,7 +2331,7 @@ X1C_PUSH_STATUS = {
                 },
             ],
         },
-        "vt_tray": [{"id": "254"}],
+        "vt_tray": {"id": "254", "tray_type": "TPU"},
     }
 }
 
@@ -2353,7 +2351,7 @@ class DisplayStateTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state["bed_temper"], 60.0)
         self.assertEqual(state["mc_percent"], 42)
         self.assertEqual(state["ams"]["tray_now"], 4)
-        self.assertEqual(state["vt_tray"], [{"id": "254"}])
+        self.assertEqual(state["vt_tray"], [{"id": "254", "tray_type": "TPU"}])
         unit = state["ams"]["ams"][0]
         self.assertEqual(unit["temp"], "24.4")
 
@@ -2459,6 +2457,10 @@ def h2d_extruder(state, left_snow, right_snow, left_info=0b10, right_info=0b10):
     }
 
 
+# The CI pins an older FilaMan core; the end-to-end checks need its Display API.
+HAS_DISPLAY_SERVICE = importlib.util.find_spec("app.services.display_service") is not None
+
+
 class DualNozzleDisplayStateTests(unittest.IsolatedAsyncioTestCase):
     """Which tray feeds which hotend, for printers with two of them."""
 
@@ -2504,6 +2506,7 @@ class DualNozzleDisplayStateTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("extruder_slots", state)
         self.assertNotIn("active_extruder", state)
 
+    @unittest.skipUnless(HAS_DISPLAY_SERVICE, "FilaMan core without the Display API")
     async def test_filaman_marks_the_tray_of_the_hotend_in_use(self):
         """End to end through FilaMan's own normaliser, not just the snapshot shape."""
         from app.services.display_service import normalize_driver_state
@@ -2517,3 +2520,81 @@ class DualNozzleDisplayStateTests(unittest.IsolatedAsyncioTestCase):
 
         normalized = normalize_driver_state(await driver.get_display_state())
         self.assertEqual(normalized["active_tray"], 1 * 4 + 2)
+
+    async def test_a_report_naming_one_hotend_updates_it(self):
+        """Once both hotends are known, a report with one entry is not dropped."""
+        driver, _ = make_driver(printer_model="H2D")
+        driver._update_display_state(h2d_extruder(0x100, 2, 0))
+        driver._update_display_state(
+            {"print": {"command": "push_status",
+                       "device": {"extruder": {"info": [{"id": 1, "snow": (1 << 8) | 3, "info": 2}]}}}}
+        )
+
+        slots = (await driver.get_display_state())["extruder_slots"]
+        self.assertEqual(slots["1"], {"ams_id": 1, "slot_id": 3, "has_filament": True})
+        self.assertEqual(slots["0"]["slot_id"], 0)
+
+    async def test_a_placeholder_slot_is_not_a_tray(self):
+        """Firmware sends slot 255 before it knows; that is no tray at all."""
+        driver, _ = make_driver(printer_model="H2D")
+        driver._update_display_state(h2d_extruder(0, 0xFF, 1))
+
+        slots = (await driver.get_display_state())["extruder_slots"]
+        self.assertEqual(slots["1"]["ams_id"], None)
+
+    async def test_the_hotend_in_use_gives_the_nozzle_temperature(self):
+        """nozzle_temper follows the left hotend on an H2D; the right one is in use."""
+        driver, _ = make_driver(printer_model="H2D")
+        payload = h2d_extruder(0, 0, (1 << 8) | 1)
+        payload["print"]["nozzle_temper"] = 31.0
+        info = payload["print"]["device"]["extruder"]["info"]
+        info[0]["temp"] = 220 * 65536 + 215   # right, heating to 220
+        info[1]["temp"] = 31                  # left, off
+        driver._update_display_state(payload)
+
+        state = await driver.get_display_state()
+        self.assertEqual(state["nozzle_temper"], 215.0)
+        self.assertEqual(state["nozzle_target_temper"], 220.0)
+
+    async def test_an_encoded_chamber_temperature_is_read_as_degrees(self):
+        driver, _ = make_driver(printer_model="H2D")
+        driver._update_display_state(
+            {"print": {"command": "push_status", "chamber_temper": 45 * 65536 + 38}}
+        )
+
+        self.assertEqual((await driver.get_display_state())["chamber_temper"], 38.0)
+
+    async def test_vir_slot_becomes_the_external_tray_list(self):
+        driver, _ = make_driver(printer_model="H2D")
+        driver._update_display_state(
+            {"print": {"command": "push_status",
+                       "vir_slot": [{"id": "254", "tray_type": "PLA"}, {"id": "255", "tray_type": "TPU"}]}}
+        )
+
+        trays = (await driver.get_display_state())["vt_tray"]
+        self.assertEqual([t["id"] for t in trays], ["254", "255"])
+
+    async def test_a_snapshot_already_handed_out_is_not_changed_later(self):
+        """FilaMan reads from another thread; the ams section is replaced, not edited."""
+        driver, _ = make_driver(printer_model="X1C")
+        driver._update_display_state(X1C_PUSH_STATUS)
+        before = await driver.get_display_state()
+        driver._update_display_state({"print": {"command": "push_status", "ams": {"tray_now": 255}}})
+
+        self.assertEqual(before["ams"]["tray_now"], 4)
+
+    @unittest.skipUnless(HAS_DISPLAY_SERVICE, "FilaMan core without the Display API")
+    async def test_filaman_sees_the_external_spool_of_an_x1c(self):
+        from app.services.display_service import normalize_driver_state
+
+        driver, _ = make_driver(printer_model="X1C")
+        driver._update_display_state(X1C_PUSH_STATUS)
+
+        normalized = normalize_driver_state(await driver.get_display_state())
+        external = [u for u in normalized["ams"] if u["kind"] == "external"]
+        self.assertEqual(len(external), 1)
+        self.assertEqual(external[0]["slots"][0]["material"], "TPU")
+
+
+if __name__ == "__main__":
+    unittest.main()
