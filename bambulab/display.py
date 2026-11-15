@@ -55,6 +55,62 @@ _UNIT_FIELDS = (
 )
 
 
+# Dual-nozzle printers (H2D, H2C) report which tray each hotend is fed from
+# in print.device.extruder.  Field meanings follow BambuStudio's
+# DevExtruderSystem::ParseExtruderInfo.
+#
+# snow names the tray as (ams_id << 8) | slot; 0xFFFF means nothing loaded.
+_EXTRUDER_SLOT_EMPTY = 0xFFFF
+# Bit 1 of an extruder's info: filament sits in that hotend.
+_EXTRUDER_HAS_FILAMENT = 0b10
+# Bit 8 of extruder.state: the hotend in use, 0 right and 1 left.
+_ACTIVE_EXTRUDER_SHIFT = 8
+
+
+def _extruder_slot(entry: dict[str, Any]) -> tuple[str, dict[str, Any]] | None:
+    """One hotend's entry as FilaMan's Display API reads it, or None if malformed."""
+    try:
+        ext_id = int(entry["id"])
+        snow = int(entry.get("snow", _EXTRUDER_SLOT_EMPTY))
+        flags = int(entry.get("info", 0) or 0)
+    except (KeyError, TypeError, ValueError):
+        return None
+    loaded = 0 <= snow != _EXTRUDER_SLOT_EMPTY
+    return str(ext_id), {
+        "ams_id": (snow >> 8) & 0xFF if loaded else None,
+        "slot_id": snow & 0xFF if loaded else None,
+        "has_filament": bool(flags & _EXTRUDER_HAS_FILAMENT),
+    }
+
+
+def _merge_extruders(state: dict[str, Any], print_data: dict[str, Any]) -> None:
+    """Keep extruder_slots and active_extruder, the shape display_service reads.
+
+    tray_now is a single value for the whole printer: on a dual-nozzle machine
+    with both hotends loaded it names only one of them, and on an H2D it is a
+    bare slot without its AMS.  A single-nozzle printer is left alone, its
+    tray_now already says everything.  Partial reports keep what they omit.
+    """
+    device = print_data.get("device")
+    extruder = device.get("extruder") if isinstance(device, dict) else None
+    if not isinstance(extruder, dict):
+        return
+    info = extruder.get("info")
+    if isinstance(info, list) and len(info) >= 2:
+        slots = dict(state.get("extruder_slots") or {})
+        for entry in info:
+            parsed = _extruder_slot(entry) if isinstance(entry, dict) else None
+            if parsed is not None:
+                slots[parsed[0]] = parsed[1]
+        state["extruder_slots"] = slots
+    if "extruder_slots" not in state:
+        return
+    try:
+        state["active_extruder"] = (int(extruder["state"]) >> _ACTIVE_EXTRUDER_SHIFT) & 1
+    except (KeyError, TypeError, ValueError):
+        pass
+
+
 def _merge_unit(previous: dict[str, Any] | None, incoming: dict[str, Any]) -> dict[str, Any]:
     """One AMS unit, keeping values the new report did not mention."""
     unit: dict[str, Any] = dict(previous or {})
@@ -100,6 +156,8 @@ class DisplayStateMixin:
                     for u in units
                     if isinstance(u, dict)
                 ]
+
+        _merge_extruders(state, print_data)
 
         for key in ("vt_tray", "vir_slot"):
             value = print_data.get(key)

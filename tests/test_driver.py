@@ -2439,3 +2439,81 @@ class DisplayStateTests(unittest.IsolatedAsyncioTestCase):
         state = await driver.get_display_state()
         self.assertFalse(state["connected"])
         self.assertEqual(state["ams"]["ams"][0]["temp"], "24.4")
+
+
+def h2d_extruder(state, left_snow, right_snow, left_info=0b10, right_info=0b10):
+    """device.extruder as an H2D reports it: id 0 is the right hotend, 1 the left."""
+    return {
+        "print": {
+            "command": "push_status",
+            "device": {
+                "extruder": {
+                    "state": state,
+                    "info": [
+                        {"id": 0, "snow": right_snow, "info": right_info},
+                        {"id": 1, "snow": left_snow, "info": left_info},
+                    ],
+                }
+            },
+        }
+    }
+
+
+class DualNozzleDisplayStateTests(unittest.IsolatedAsyncioTestCase):
+    """Which tray feeds which hotend, for printers with two of them."""
+
+    async def test_each_hotend_names_its_tray(self):
+        driver, _ = make_driver(printer_model="H2D")
+        # Left hotend fed from AMS 1 slot 2, right from AMS 0 slot 0; bit 8 set = left in use.
+        driver._update_display_state(h2d_extruder(0x100, (1 << 8) | 2, 0))
+
+        state = await driver.get_display_state()
+        self.assertEqual(
+            state["extruder_slots"],
+            {
+                "0": {"ams_id": 0, "slot_id": 0, "has_filament": True},
+                "1": {"ams_id": 1, "slot_id": 2, "has_filament": True},
+            },
+        )
+        self.assertEqual(state["active_extruder"], 1)
+
+    async def test_an_unloaded_hotend_names_no_tray(self):
+        driver, _ = make_driver(printer_model="H2D")
+        driver._update_display_state(h2d_extruder(0, 0xFFFF, 3, left_info=0))
+
+        slots = (await driver.get_display_state())["extruder_slots"]
+        self.assertEqual(slots["1"], {"ams_id": None, "slot_id": None, "has_filament": False})
+        self.assertEqual(slots["0"]["slot_id"], 3)
+
+    async def test_a_report_without_extruder_data_keeps_the_last_one(self):
+        driver, _ = make_driver(printer_model="H2D")
+        driver._update_display_state(h2d_extruder(0x100, 2, 0))
+        driver._update_display_state({"print": {"command": "push_status", "nozzle_temper": 220.0}})
+
+        state = await driver.get_display_state()
+        self.assertEqual(state["extruder_slots"]["1"]["slot_id"], 2)
+        self.assertEqual(state["active_extruder"], 1)
+
+    async def test_a_single_nozzle_printer_keeps_tray_now_alone(self):
+        driver, _ = make_driver(printer_model="X1C")
+        payload = {"print": {**X1C_PUSH_STATUS["print"],
+                             "device": {"extruder": {"state": 0, "info": [{"id": 0, "snow": 0}]}}}}
+        driver._update_display_state(payload)
+
+        state = await driver.get_display_state()
+        self.assertNotIn("extruder_slots", state)
+        self.assertNotIn("active_extruder", state)
+
+    async def test_filaman_marks_the_tray_of_the_hotend_in_use(self):
+        """End to end through FilaMan's own normaliser, not just the snapshot shape."""
+        from app.services.display_service import normalize_driver_state
+
+        driver, _ = make_driver(printer_model="H2D")
+        # tray_now on an H2D is a bare slot number; on its own it would point at AMS 0.
+        driver._update_display_state(
+            {"print": {"command": "push_status", "ams": {"tray_now": 2}}}
+        )
+        driver._update_display_state(h2d_extruder(0x100, (1 << 8) | 2, 0))
+
+        normalized = normalize_driver_state(await driver.get_display_state())
+        self.assertEqual(normalized["active_tray"], 1 * 4 + 2)
