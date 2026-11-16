@@ -357,13 +357,22 @@ class SlotSupportMixin:
 
         slots = []
         tray_counts: dict[int, int] = {}
-        for slot_index in dict.fromkeys((*previous, *reported)):
+        slot_indices = dict.fromkeys((*previous, *reported, *self._unverified_ams_trays, *self._saved_ams_slots))
+        for slot_index in slot_indices:
+            unverified = self._unverified_ams_trays.pop(slot_index, {})
             ams_id, tray_id = self._parse_slot_index(slot_index)
             if not self._ams_unit_is_connected(ams_id, unit_bits):
                 continue
-            tray_counts[ams_id] = tray_counts.get(ams_id, 0) + 1
             old_slot = previous.get(slot_index, {})
             tray = reported.get(slot_index, {})
+            incoming_uuid = self._normalize_hex_identifier(tray.get("tray_uuid"), 32)
+            unverified_uuid = self._normalize_hex_identifier(unverified.get("tray_uuid"), 32)
+            if (
+                "tray_uuid" in tray
+                and "tray_uuid" in unverified
+                and incoming_uuid != unverified_uuid
+            ):
+                unverified = {}
             state = str(tray.get("state"))
             id_only = len(tray) == 1 and "id" in tray
             if state in _AMS_STATE_PRESENCE:
@@ -372,13 +381,27 @@ class SlotSupportMixin:
                 self._ams_state_presence.pop(slot_index, None)
 
             present = self._ams_reported_presence(ams_id, tray_id)
+            if present is None and not (old_slot or tray or unverified):
+                continue
+            tray_counts[ams_id] = tray_counts.get(ams_id, 0) + 1
             if present is None:
+                # A blank profile alone cannot invalidate a saved spool link.
+                saved_blank_profile = slot_index in self._saved_ams_slots and not tray.get("tray_type")
+                if not old_slot and not id_only and ("tray_type" not in tray or saved_blank_profile):
+                    self._unverified_ams_trays[slot_index] = {**unverified, **tray}
+                    continue
                 if not tray:
                     present = old_slot.get("present", False)
                 elif id_only:
                     present = False  # Legacy empty trays can contain only the ID.
                 else:
                     present = bool(tray["tray_type"]) if "tray_type" in tray else old_slot.get("present", False)
+
+            if ams_id not in units:
+                units[ams_id] = {
+                    "ams_id": ams_id, "humidity": None, "temp": None,
+                    "serial": self._ams_serials.get(str(ams_id)), "info": None,
+                }
 
             if ams_id >= 128:
                 slot_name = f"AMS HT {ams_id - 127} - Slot {tray_id + 1}"
@@ -391,13 +414,14 @@ class SlotSupportMixin:
             # a new physical insertion, even when a mask arrives on its own.
             metadata = {}
             if present:
-                incoming_uuid = self._normalize_hex_identifier(tray.get("tray_uuid"), 32)
                 old_uuid = self._confirmed_tray_uuids.get(slot_index)
                 same_spool = not (incoming_uuid and old_uuid and incoming_uuid != old_uuid)
                 if old_slot.get("present") and state != "9" and same_spool:
                     metadata = old_slot
                 if _AMS_STATE_PRESENCE.get(state) is not False:
-                    metadata = {**metadata, **tray}
+                    if state == "9":
+                        unverified = {}
+                    metadata = {**metadata, **unverified, **tray}
             slots.append({
                 "slot_index": slot_index,
                 "slot_name": slot_name,
