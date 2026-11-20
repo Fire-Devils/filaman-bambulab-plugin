@@ -84,12 +84,16 @@ context.inventory = { items: [], total: 0, page: 1, pageSize: 48, manufacturers:
 context.content = { innerHTML: '', querySelectorAll: () => [] };
 context.summary = { innerHTML: '' };
 context.document = { getElementById: () => null };
+context.URL = URL;
+context.window = { location: { origin: 'https://filaman.example' } };
+context.printerFilter = { value: 'all' };
 vm.runInContext(slice('const safeHttpUrl =', 'const requestJson =')
   + slice('const colorHex =', 'const finiteNumber =')
-  + slice('const imageMetadata =', 'const productCode =')
+  + slice('const imageMetadata =', '// Keep at most one gallery page')
   + slice('const bindImageFallbacks =', 'const colorPill =')
+  + slice('const renderSlot =', 'const inventoryPercent =')
   + slice('const renderInventoryCard =', 'const setButtonLoading =')
-  + ';globalThis.renderInventory = renderInventory;', context);
+  + ';globalThis.renderInventory = renderInventory; globalThis.renderAms = renderAms;', context);
 for (const [weight, metrics, card, total] of [
   [null, { effective_remaining_weight_g: 1000, remaining_percent: 100 }, '1000 g', '1.0 kg'],
   [500, { effective_remaining_weight_g: 0, remaining_percent: 0 }, '0 g', '0.0 kg'],
@@ -103,3 +107,73 @@ for (const [weight, metrics, card, total] of [
   assert.ok(context.summary.innerHTML.includes(`>${total}</strong>`), `summary shows ${total}`);
 }
 console.log('Plugin gallery cards and total use effective remaining weight: passed');
+
+// Exercise the shared selection through both views, including the AMS image count.
+context.t = (key, params) => key === 'slot.image' ? `Image: ${params.provider}` : key;
+const nativeImage = 'https://example.com/filament.jpg';
+const catalogImage = 'https://example.com/catalog.jpg';
+const legacyImage = 'https://example.com/legacy.jpg';
+const slotImage = 'https://example.com/slot.jpg';
+const blackSpool = {
+  id: 4,
+  filament: {
+    designation: 'Black',
+    material_type: 'PLA',
+    manufacturer: { name: 'ELEGOO' },
+    shop_url: 'https://example.com/filament',
+    image_url: nativeImage,
+  },
+};
+
+const renderImages = (spool, slotFields = {}) => {
+  context.inventory.items = [spool];
+  context.renderInventory();
+  const inventory = context.content.innerHTML;
+  context.amsState = [{
+    printer: { id: 1, name: 'Bambu Lab H2S' },
+    health: {
+      connected: true,
+      slots: [{ present: true, slot_index: '1-1', spool_id: spool.id, ...slotFields }],
+    },
+    spools: new Map([[spool.id, spool]]),
+  }];
+  context.renderAms();
+  return { inventory, ams: context.content.innerHTML, summary: context.summary.innerHTML };
+};
+
+const native = renderImages(blackSpool);
+for (const view of [native.inventory, native.ams]) {
+  assert.ok(view.includes(`src="${nativeImage}"`), 'native filament image appears in both views');
+}
+assert.match(native.summary, /ams\.catalogImages<\/span><strong class="metric-value">1<\/strong>/);
+assert.match(native.ams, /Image: common\.catalog<\/a>/, 'native image has a generic source label');
+
+const catalog = renderImages({
+  ...blackSpool,
+  filament: { ...blackSpool.filament, custom_fields: {
+    filament_image_url: catalogImage, bambu_shop_image_url: legacyImage,
+  } },
+}, { shop_image_url: slotImage });
+assert.ok(catalog.inventory.includes(`src="${catalogImage}"`), 'catalog metadata takes precedence');
+assert.ok(catalog.ams.includes(`src="${slotImage}"`), 'AMS slot image keeps precedence');
+assert.match(catalog.ams, /Image: Bambu Lab<\/a>/, 'AMS slot image keeps its provider label');
+
+const legacy = renderImages({
+  ...blackSpool,
+  filament: { ...blackSpool.filament, custom_fields: {
+    filament_image_url: 'javascript:alert(1)', bambu_shop_image_url: legacyImage,
+  } },
+});
+for (const view of [legacy.inventory, legacy.ams]) {
+  assert.ok(view.includes(`src="${legacyImage}"`), 'valid legacy URL can replace an invalid catalog URL');
+}
+
+const invalid = renderImages({
+  ...blackSpool, filament: { ...blackSpool.filament, image_url: 'data:image/png,invalid' },
+});
+for (const view of [invalid.inventory, invalid.ams]) {
+  assert.doesNotMatch(view, /<img class="shop-image"/);
+  assert.match(view, /class="spool-art"/);
+}
+assert.match(invalid.summary, /ams\.catalogImages<\/span><strong class="metric-value">0<\/strong>/);
+console.log('Plugin gallery uses native filament images and preserves catalog precedence: passed');

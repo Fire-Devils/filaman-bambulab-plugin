@@ -437,10 +437,21 @@
 
       const imageMetadata = (filament = {}) => {
         const fields = filament.custom_fields || {};
-        const imageUrl = safeHttpUrl(fields.filament_image_url || fields.bambu_shop_image_url);
-        const sourceUrl = safeHttpUrl(fields.filament_image_source_url || fields.bambu_shop_source_url || filament.shop_url);
-        const provider = fields.filament_image_provider || (fields.bambu_shop_image_url ? 'bambulab' : '');
-        return { imageUrl, sourceUrl, provider };
+        const bambuImageUrl = safeHttpUrl(fields.bambu_shop_image_url);
+        const catalogImageUrl = safeHttpUrl(fields.filament_image_url) || bambuImageUrl;
+        if (catalogImageUrl) {
+          const sourceUrl = safeHttpUrl(fields.filament_image_source_url || fields.bambu_shop_source_url || filament.shop_url);
+          const provider = fields.filament_image_provider || (bambuImageUrl ? 'bambulab' : '');
+          return { imageUrl: catalogImageUrl, sourceUrl, provider };
+        }
+        return { imageUrl: safeHttpUrl(filament.image_url), sourceUrl: safeHttpUrl(filament.shop_url), provider: '' };
+      };
+
+      const slotImageMetadata = (slot, spool) => {
+        const catalog = imageMetadata(spool?.filament);
+        const imageUrl = safeHttpUrl(slot.shop_image_url);
+        if (!imageUrl) return catalog;
+        return { imageUrl, sourceUrl: safeHttpUrl(slot.shop_source_url) || catalog.sourceUrl, provider: 'bambulab' };
       };
 
       const providerLabel = (provider) => {
@@ -519,10 +530,8 @@
       const renderSlot = (slot, spool, printerId) => {
         const present = Boolean(slot.present || slot.tray_type);
         const filament = spool?.filament || {};
-        const catalog = imageMetadata(filament);
+        const { imageUrl, sourceUrl, provider } = slotImageMetadata(slot, spool);
         const hex = colorHex(slot.tray_color || filament.colors?.[0]?.color?.hex_code);
-        const imageUrl = safeHttpUrl(slot.shop_image_url) || catalog.imageUrl;
-        const sourceUrl = safeHttpUrl(slot.shop_source_url) || catalog.sourceUrl;
         const spoolUrl = spool?.id ? `/spools/${encodeURIComponent(spool.id)}` : '';
         const remain = finiteNumber(slot.remain);
         const remainingWeight = spoolRemainingWeight(spool);
@@ -541,7 +550,7 @@
           <article class="slot ${present ? '' : 'empty'}">
             <div class="slot-media" data-fallback-color="${escapeHtml(hex)}" data-reel="${escapeHtml(JSON.stringify(reel))}" data-reel-key="${escapeHtml(reelKey)}">
               ${media}
-              ${imageUrl && sourceUrl ? `<a class="image-source" href="${escapeHtml(sourceUrl)}" target="_blank" rel="noopener noreferrer">${escapeHtml(t('slot.image', { provider: providerLabel(catalog.provider || 'bambulab') }))}</a>` : ''}
+              ${imageUrl && sourceUrl ? `<a class="image-source" href="${escapeHtml(sourceUrl)}" target="_blank" rel="noopener noreferrer">${escapeHtml(t('slot.image', { provider: providerLabel(provider) }))}</a>` : ''}
             </div>
             <div class="slot-body">
               <div class="slot-kicker"><span>${escapeHtml(slot.slot_name || slot.slot_index || 'AMS Slot')}</span>${colorPill(reel, hex)}</div>
@@ -570,7 +579,9 @@
         const occupied = allSlots.filter((slot) => slot.present || slot.tray_type).length;
         const connected = visible.filter((entry) => entry.health.connected).length;
         const linked = allSlots.filter((slot) => slot.spool_id).length;
-        const images = allSlots.filter((slot) => slot.shop_image_url).length;
+        const images = visible.reduce((count, { health, spools }) => count + (health.slots || []).filter(
+          (slot) => slotImageMetadata(slot, spools.get(Number(slot.spool_id))).imageUrl,
+        ).length, 0);
         renderMetrics([
           [t('ams.onlinePrinters'), `${connected}/${visible.length}`, t('ams.mqttConnection')],
           [t('ams.occupiedSlots'), occupied, t('ams.slotsDetected', { count: allSlots.length })],
