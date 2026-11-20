@@ -177,3 +177,45 @@ for (const view of [invalid.inventory, invalid.ams]) {
 }
 assert.match(invalid.summary, /ams\.catalogImages<\/span><strong class="metric-value">0<\/strong>/);
 console.log('Plugin gallery uses native filament images and preserves catalog precedence: passed');
+
+// Restore stored assignments only when the live driver has no assignment to report.
+vm.runInContext(slice('const canonicalSlotIndex =', 'const loadAms =') + ';globalThis.loadAmsSlots = loadAmsSlots;', context);
+const presentSlot = { slot_index: '0-0', present: true, tray_type: 'PLA', tray_info_idx: 'PLA_CUSTOM', tray_color: '161616FF' };
+const savedSlot = {
+  is_active: true,
+  slot_no: 0,
+  custom_fields: { slot_index: '0-0' },
+  assignment: { present: true, spool_id: 4, tray_type: 'PLA', tray_info_idx: 'PLA_CUSTOM', tray_color: '000000' },
+};
+let reads = 0;
+context.requestJson = async (url) => {
+  assert.equal(url, '/api/v1/printers/1/slots');
+  reads++;
+  return [savedSlot];
+};
+
+const restoredSlots = await context.loadAmsSlots(1, { connected: true, slots: [presentSlot] });
+assert.equal(restoredSlots[0].spool_id, 4);
+context.amsState = [{ ...context.amsState[0], health: { connected: true, slots: restoredSlots }, spools: new Map([[4, blackSpool]]) }];
+context.renderAms();
+assert.ok(context.content.innerHTML.includes(`src="${nativeImage}"`), 'restored A1 shows the native filament photo');
+
+for (const [connected, slot] of [
+  [true, { ...presentSlot, spool_id: 9 }],
+  [true, { ...presentSlot, spool_id: null }],
+  [true, { ...presentSlot, present: false }],
+  [false, presentSlot],
+]) {
+  const projected = await context.loadAmsSlots(1, { connected, slots: [slot] });
+  assert.equal(projected[0], slot, 'live assignments, explicit unlink, empty, and offline slots are preserved');
+}
+assert.equal(reads, 1, 'only an occupied, connected slot without a live assignment needs a lookup');
+const moved = { ...presentSlot, tray_info_idx: 'GFA00' };
+const movedSlots = await context.loadAmsSlots(1, { connected: true, slots: [moved] });
+assert.equal(movedSlots[0], moved, 'different live filament metadata rejects the stored assignment');
+context.requestJson = async () => [{ ...savedSlot, custom_fields: { slot_index: '255-255' } }];
+const external = { ...presentSlot, slot_index: '255-1' };
+assert.equal((await context.loadAmsSlots(1, { connected: true, slots: [external] }))[0].spool_id, 4);
+context.requestJson = async () => { throw new Error('unavailable'); };
+assert.equal((await context.loadAmsSlots(1, { connected: true, slots: [presentSlot] }))[0], presentSlot);
+console.log('AMS gallery restores stored spool links after a driver restart: passed');

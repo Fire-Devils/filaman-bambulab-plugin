@@ -747,6 +747,48 @@
         catch { return requestJson(url); }
       };
 
+      const canonicalSlotIndex = (slotIndex) => {
+        const parts = /^(\d+)-(\d+)$/.exec(slotIndex);
+        if (!parts) return slotIndex;
+        const ams = Number(parts[1]);
+        const tray = Number(parts[2]);
+        if (ams === 254) return tray === 1 || tray === 255 ? '255-1' : '255-0';
+        if (ams === 255 && (tray === 254 || tray === 255)) return `255-${tray - 254}`;
+        return `${ams}-${tray}`;
+      };
+
+      const loadAmsSlots = async (printerId, health) => {
+        const slots = health.slots || [];
+        // A missing ID can follow a driver restart. An explicit null is a live unlink.
+        const needsAssignment = (slot) => slot.present === true && slot.spool_id === undefined;
+        if (!health.connected || !slots.some(needsAssignment)) return slots;
+
+        let storedSlots;
+        try { storedSlots = await requestJson(`/api/v1/printers/${encodeURIComponent(printerId)}/slots`); }
+        catch { return slots; }
+        if (!Array.isArray(storedSlots)) return slots;
+
+        const assignments = new Map();
+        for (const stored of storedSlots) {
+          if (!stored.is_active || stored.assignment?.present !== true) continue;
+          const legacyIndex = stored.slot_no >= 1000 ? `255-${stored.slot_no - 1000}` : `${Math.floor(stored.slot_no / 4)}-${stored.slot_no % 4}`;
+          const rawIndex = stored.custom_fields?.slot_index || legacyIndex;
+          const index = canonicalSlotIndex(rawIndex);
+          if (rawIndex === index || !assignments.has(index)) assignments.set(index, stored.assignment);
+        }
+
+        return slots.map((slot) => {
+          if (!needsAssignment(slot)) return slot;
+          const assignment = assignments.get(canonicalSlotIndex(slot.slot_index));
+          const spoolId = assignment?.spool_id;
+          if (!Number.isSafeInteger(spoolId) || spoolId <= 0) return slot;
+          for (const field of ['tray_type', 'tray_info_idx']) {
+            if (assignment[field] && slot[field] && assignment[field] !== slot[field]) return slot;
+          }
+          return { ...slot, spool_id: spoolId };
+        });
+      };
+
       const loadAms = async (force = false) => {
         if (amsLoading) return;
         amsLoading = true;
@@ -756,12 +798,13 @@
           const printers = (response.items || []).filter((printer) => printer.driver_key === 'bambulab' && printer.is_active !== false);
           amsState = await Promise.all(printers.map(async (printer) => {
             const health = await loadDriverHealth(printer.id, force);
-            const spoolIds = [...new Set((health.slots || []).map((slot) => Number(slot.spool_id)).filter(Number.isFinite))];
+            const slots = await loadAmsSlots(printer.id, health);
+            const spoolIds = [...new Set(slots.map((slot) => Number(slot.spool_id)).filter((id) => Number.isSafeInteger(id) && id > 0))];
             const spoolResults = await Promise.all(spoolIds.map(async (id) => {
               try { return await requestJson(`/api/v1/spools/${encodeURIComponent(id)}?include_metrics=true`); }
               catch { return null; }
             }));
-            return { printer, health, spools: new Map(spoolResults.filter(Boolean).map((spool) => [Number(spool.id), spool])) };
+            return { printer, health: { ...health, slots }, spools: new Map(spoolResults.filter(Boolean).map((spool) => [Number(spool.id), spool])) };
           }));
           const current = printerFilter.value;
           printerFilter.innerHTML = `<option value="all">${escapeHtml(t('page.allPrinters'))}</option>` + printers.map((printer) => `<option value="${escapeHtml(printer.id)}">${escapeHtml(printer.name)}</option>`).join('');
