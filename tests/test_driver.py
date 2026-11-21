@@ -3367,7 +3367,6 @@ class DisplayStateTests(unittest.IsolatedAsyncioTestCase):
         driver._on_message(
             None,
             None,
-            None,
             SimpleNamespace(
                 topic="device/X/report",
                 payload=json.dumps(
