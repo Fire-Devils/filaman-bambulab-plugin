@@ -17,6 +17,7 @@ from app.plugins.base import BaseDriver
 
 from .catalog import CatalogMixin
 from .catalog_enrichment import CatalogEnrichmentMixin
+from .display import DisplayStateMixin
 from .slots import SlotSupportMixin
 from .spool_sync import SpoolSyncMixin
 from .state import PendingSpool
@@ -32,6 +33,7 @@ class Driver(
     CatalogMixin,
     SpoolSyncMixin,
     SlotSupportMixin,
+    DisplayStateMixin,
     BaseDriver,
 ):
     """Connect a Bambu printer to FilaMan and coordinate plugin services."""
@@ -66,6 +68,7 @@ class Driver(
         )
         self._current_slots: list[dict[str, Any]] = []
         self._current_ams_units: list[dict[str, Any]] = []
+        self._display_state: dict[str, Any] = {}
         self._printer_model = config.get("printer_model", "P1S")
         self._is_ams_lite = self._printer_model in ("A1", "A1_MINI")
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -235,6 +238,9 @@ class Driver(
 
             # push_status Nachrichten verarbeiten
             if payload.get("print", {}).get("command") == "push_status":
+                # Vor _process_slots: das steigt bei Nachrichten ohne Tray-Daten
+                # früh aus, und genau die tragen die Druckertemperaturen.
+                self._update_display_state(payload)
                 self._process_slots(payload)
                 return
 
