@@ -10,7 +10,7 @@ import time
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm.attributes import flag_modified
 
@@ -108,10 +108,21 @@ class SpoolSyncMixin:
                     "Bambu material/subtype/color matching"
                 )
 
-        tray_type = str(slot.get("tray_type") or "").strip()
+        tray_type = str(slot.get("tray_type") or "").strip().lower()
         tray_color = self._normalize_tray_color(slot.get("tray_color"))
         if not tray_type or not tray_color:
             return None
+
+        material_type = func.lower(Filament.material_type)
+        material_matches = material_type == tray_type
+        if tray_type == "pla-cf":
+            material_matches = or_(
+                material_matches,
+                and_(
+                    material_type == "pla",
+                    func.lower(func.trim(Filament.material_subgroup)) == "cf",
+                ),
+            )
 
         result = await db.execute(
             select(Filament)
@@ -120,18 +131,27 @@ class SpoolSyncMixin:
             .join(Color, Color.id == FilamentColor.color_id)
             .where(
                 func.lower(Manufacturer.name).in_(("bambu", "bambu lab")),
-                func.lower(Filament.material_type) == tray_type.lower(),
+                material_matches,
                 func.lower(Color.hex_code) == f"#{tray_color}".lower(),
             )
         )
         candidates = list(result.scalars().unique().all())
+        exact_type = candidates
+        if tray_type == "pla-cf":
+            exact_type = [
+                item for item in candidates if item.material_type.lower() == tray_type
+            ]
         if tray_index_candidate_ids:
+            # A tray-index match wins, with the original material spelling as a tiebreaker.
             indexed_candidates = [
+                item for item in exact_type if item.id in tray_index_candidate_ids
+            ] or [
                 item for item in candidates if item.id in tray_index_candidate_ids
             ]
             selected = self._select_bambu_candidate(indexed_candidates, slot)
             if selected is not None:
                 return selected
+        candidates = exact_type or candidates
         mapped_name = self._bambu_filaments.get(tray_info_idx)
         if mapped_name:
             exact = [
@@ -260,10 +280,10 @@ class SpoolSyncMixin:
         candidates: list[dict[str, Any]] = []
         for slot in slots:
             tray_uuid = self._normalize_hex_identifier(slot.get("tray_uuid"), 32)
-            if not tray_uuid:
+            if not tray_uuid or not slot.get("present"):
                 continue
-            last_attempt = self._auto_import_last_attempt.get(tray_uuid, 0)
-            if now - last_attempt < AUTO_IMPORT_RETRY_SECONDS:
+            last_attempt = self._auto_import_last_attempt.get(tray_uuid)
+            if last_attempt is not None and now - last_attempt < AUTO_IMPORT_RETRY_SECONDS:
                 continue
             self._auto_import_last_attempt[tray_uuid] = now
             candidates.append(dict(slot))
@@ -276,33 +296,36 @@ class SpoolSyncMixin:
         )
 
     def _schedule_slot_location_release(self, slot_index: str) -> None:
-        """Queue the location cleanup for a tray that just went empty."""
-        parsed = self._parse_slot_index(slot_index)
-        if not parsed or not self._loop:
-            return
-        ams_id, tray_id = parsed
-        self._loop.call_soon_threadsafe(
-            lambda: asyncio.create_task(
-                self._release_slot_location(ams_id, tray_id)
-            )
-        )
+        """Queue the location cleanup for an empty or replaced tray."""
+        self._schedule_slot_location_update(slot_index, None)
 
     def _schedule_slot_location_update(
-        self, slot_index: str, spool_id: int
+        self, slot_index: str, spool_id: int | None
     ) -> None:
-        """Queue a known replacement spool for its slot location."""
-        parsed = self._parse_slot_index(slot_index)
-        if not parsed or not self._loop:
-            return
-        ams_id, tray_id = parsed
-        self._loop.call_soon_threadsafe(
-            lambda: asyncio.create_task(
-                self._update_spool_location(
-                    spool_id,
-                    ams_id,
-                    tray_id,
-                )
+        """Queue reconciliation of the managed location with the tray link."""
+        if self._loop:
+            self._loop.call_soon_threadsafe(
+                lambda: asyncio.create_task(self._sync_slot_location(slot_index, spool_id))
             )
+
+    async def _sync_slot_location(self, slot_index: str, spool_id: int | None) -> None:
+        """Skip stale work and serialize writes while the database yields."""
+        parsed = self._parse_slot_index(slot_index)
+        if not parsed:
+            return
+        async with self._slot_location_lock:
+            if self._slot_spool_ids.get(slot_index) != spool_id:
+                return
+            if spool_id is None:
+                await self._release_slot_location(*parsed)
+            else:
+                await self._update_spool_location(spool_id, *parsed)
+
+    def _slot_has_rfid(self, slot_index: str, tray_uuid: str) -> bool:
+        return any(
+            slot["slot_index"] == slot_index and slot.get("present")
+            and self._normalize_hex_identifier(slot.get("tray_uuid"), 32) == tray_uuid
+            for slot in self._current_slots
         )
 
     async def _auto_import_rfid_spools(
@@ -323,7 +346,8 @@ class SpoolSyncMixin:
             for slot in slots:
                 tray_uuid = self._normalize_hex_identifier(slot.get("tray_uuid"), 32)
                 tag_uid = self._normalize_hex_identifier(slot.get("tag_uid"), 16)
-                if not tray_uuid:
+                slot_index = str(slot.get("slot_index") or "")
+                if not tray_uuid or not self._slot_has_rfid(slot_index, tray_uuid):
                     continue
 
                 external_id = f"{BAMBU_EXTERNAL_ID_PREFIX}{tray_uuid}"
@@ -342,6 +366,12 @@ class SpoolSyncMixin:
                         db, external_id, tray_uuid
                     )
 
+                    if not self._slot_has_rfid(slot_index, tray_uuid):
+                        continue
+                    if slot_index in self._explicit_slot_assignments and (
+                        spool is None or self._slot_spool_ids.get(slot_index) != spool.id
+                    ):
+                        continue
                     if spool is None:
                         if not self._auto_import_spools:
                             # Nothing known and nothing may be created, so this
@@ -375,6 +405,10 @@ class SpoolSyncMixin:
                             )
                             continue
 
+                        if slot_index in self._explicit_slot_assignments or not self._slot_has_rfid(
+                            slot_index, tray_uuid
+                        ):
+                            continue
                         custom_fields = {}
                         if tag_uid:
                             custom_fields[BAMBU_RFID_TAG_1_FIELD] = tag_uid
@@ -436,17 +470,14 @@ class SpoolSyncMixin:
                     self._spool_ids_by_tray_uuid.get(tray_uuid) != spool.id
                 )
                 self._spool_ids_by_tray_uuid[tray_uuid] = spool.id
-                slot_index = str(slot.get("slot_index") or "")
-                slot_mapping_changed = bool(slot_index) and (
-                    self._slot_spool_ids.get(slot_index) != spool.id
+                slot_mapping_changed = (
+                    slot_index not in self._explicit_slot_assignments
+                    and self._slot_has_rfid(slot_index, tray_uuid)
+                    and self._slot_spool_ids.get(slot_index) != spool.id
                 )
-                if slot_index:
+                if slot_mapping_changed:
                     self._slot_spool_ids[slot_index] = spool.id
-                parsed_slot = self._parse_slot_index(slot_index)
-                if parsed_slot and slot_mapping_changed:
-                    await self._update_spool_location(
-                        spool.id, parsed_slot[0], parsed_slot[1]
-                    )
+                    await self._sync_slot_location(slot_index, spool.id)
                 changed = (
                     changed
                     or created
@@ -470,7 +501,6 @@ class SpoolSyncMixin:
             if changed:
                 await event_bus.publish({"event": "spools_changed"})
                 self._emit_slots_with_spool_ids()
-
 
     def _generate_slot_location_name(self, ams_id: int, tray_id: int) -> str:
         """Generiert Location-Namen für AMS-Slot.
@@ -535,18 +565,25 @@ class SpoolSyncMixin:
         )
         location.custom_fields = custom_fields
 
-    async def _find_slot_location(
-        self, db, ams_id: int, tray_id: int
-    ) -> Location | None:
-        """Find the stable slot or conservatively adopt an owned legacy row."""
+    async def _find_slot_locations(
+        self, db, ams_id: int, tray_id: int, *, adopt_by_name: bool = True
+    ) -> list[Location]:
+        """Find slot locations in preference order, including historical aliases."""
         identifier = self._generate_slot_location_identifier(ams_id, tray_id)
-        result = await db.execute(
-            select(Location).where(Location.identifier == identifier)
+        identifiers = [identifier]
+        if ams_id == 255 and tray_id in (0, 1, 254, 255):
+            alias = tray_id - 254 if tray_id >= 254 else tray_id + 254
+            identifiers.append(self._generate_slot_location_identifier(ams_id, alias))
+        result = await db.scalars(
+            select(Location)
+            .where(Location.identifier.in_(identifiers))
+            .order_by((Location.identifier == identifier).desc())
         )
-        location = result.scalar_one_or_none()
-        if location is not None:
-            self._refresh_slot_location_metadata(location)
-            return location
+        locations = list(result)
+        if locations:
+            for location in locations:
+                self._refresh_slot_location_metadata(location)
+            return locations
 
         # Current plugin versions always set an identifier. Only identifier-less
         # rows can be legacy candidates; a manual or foreign location with its
@@ -575,9 +612,7 @@ class SpoolSyncMixin:
             managed_candidates.append(candidate)
 
         if len(managed_candidates) == 1:
-            return self._adopt_legacy_slot_location(
-                managed_candidates[0], identifier
-            )
+            return [self._adopt_legacy_slot_location(managed_candidates[0], identifier)]
         if len(managed_candidates) > 1:
             logger.warning(
                 "Multiple identifier-less Bambu locations claim printer %s; "
@@ -586,7 +621,10 @@ class SpoolSyncMixin:
                 ams_id,
                 tray_id,
             )
-            return None
+            return []
+
+        if not adopt_by_name:
+            return []
 
         name_candidates = [
             candidate
@@ -594,14 +632,14 @@ class SpoolSyncMixin:
             if str(candidate.name or "").casefold() == legacy_name.casefold()
         ]
         if len(name_candidates) == 1:
-            return self._adopt_legacy_slot_location(name_candidates[0], identifier)
+            return [self._adopt_legacy_slot_location(name_candidates[0], identifier)]
         if len(name_candidates) > 1:
             logger.warning(
                 "Multiple locations match legacy Bambu slot name '%s'; "
                 "not adopting any",
                 legacy_name,
             )
-        return None
+        return []
 
     async def _unique_slot_location_name(
         self,
@@ -670,15 +708,15 @@ class SpoolSyncMixin:
         slot_location_name = self._generate_slot_location_name(ams_id, tray_id)
         try:
             async with async_session_maker() as db:
-                location = await self._find_slot_location(db, ams_id, tray_id)
-                if location is None:
-                    return
-                await self._clear_slot_location(
-                    db,
-                    location,
-                    location.name or slot_location_name,
-                    keep_spool_id=None,
+                locations = await self._find_slot_locations(
+                    db, ams_id, tray_id, adopt_by_name=False
                 )
+                if not locations:
+                    return
+                for location in locations:
+                    await self._clear_slot_location(
+                        db, location, location.name or slot_location_name, keep_spool_id=None
+                    )
                 # Also persists a conservative legacy-location adoption even if
                 # the already-empty location contained no spool to release.
                 await db.commit()
@@ -703,11 +741,12 @@ class SpoolSyncMixin:
             async with async_session_maker() as db:
                 # The identifier represents the physical slot. Its display name
                 # may change when the printer is renamed and is not an identity.
-                location = await self._find_slot_location(db, ams_id, tray_id)
+                locations = await self._find_slot_locations(db, ams_id, tray_id)
+                location = locations[0] if locations else None
                 slot_location_name = await self._unique_slot_location_name(
                     db,
                     preferred_name,
-                    identifier,
+                    location.identifier if location else identifier,
                 )
 
                 # 2. Location erstellen falls nicht vorhanden
@@ -741,9 +780,10 @@ class SpoolSyncMixin:
 
                 # Ein Tray hält eine Spule. Wer sonst noch auf diesem Lagerort
                 # steht, lag früher einmal darin und liegt längst woanders.
-                await self._clear_slot_location(
-                    db, location, slot_location_name, keep_spool_id=filaman_spool_id
-                )
+                for existing in locations:
+                    await self._clear_slot_location(
+                        db, existing, existing.name or slot_location_name, keep_spool_id=filaman_spool_id
+                    )
 
                 if spool.location_id == location.id:
                     logger.debug(
