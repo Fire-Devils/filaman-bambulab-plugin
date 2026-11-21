@@ -11,6 +11,7 @@ A FilaMan printer driver plugin that connects to Bambu Lab printers via MQTT, re
 - Optional automatic import of Bambu RFID spools
 - Optional estimated-weight synchronization, disabled by default
 - Dedicated responsive AMS and spool overview page
+- Live printer state for FilaMan's AMS View: connection, job, temperatures, AMS climate and drying
 - Optional color-specific Bambu product images loaded directly from Bambu's CDN, with persistent URL metadata
 - Read-only mode for status and inventory synchronization without printer changes
 - Automatic spool-to-tray matching with a 60-second default timeout (caller-overridable)
@@ -38,6 +39,7 @@ The Python implementation is split by responsibility while keeping `driver.py` a
 - `slots.py` normalizes identifiers and parses AMS, AMS Lite, AMS HT and external tray payloads.
 - `spool_sync.py` owns safe filament matching, RFID spool upserts, remaining weight and managed locations.
 - `catalog.py` resolves and stores Bambu product image metadata without downloading image binaries into FilaMan.
+- `display.py` keeps the live snapshot FilaMan's Display API reads through `get_display_state()`.
 - `catalog_enrichment.py` coordinates event-driven and periodic inventory image scans across driver instances.
 - `state.py` contains the small runtime state objects shared by the driver modules.
 
