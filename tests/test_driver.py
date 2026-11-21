@@ -1457,6 +1457,40 @@ class ReadOnlyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(driver.health()["slots"][0]["spool_id"], 17)
         driver._send_filament_setting.assert_called_once_with(0, 0, filament)
 
+    def _connect_publishes(self, rc, read_only):
+        driver, _ = make_driver(read_only=read_only)
+        client = Mock()
+        mqtt_client = SimpleNamespace(command_topic="device/serial/request")
+        driver._on_connect(mqtt_client, client, None, None, rc, None)
+        return [
+            (c.args[0], json.loads(c.args[1])) for c in client.publish.call_args_list
+        ]
+
+    def test_connect_read_only_publishes_only_pushall(self):
+        self.assertEqual(
+            self._connect_publishes(0, True),
+            [("device/serial/request", {"pushing": {"command": "pushall"}})],
+        )
+
+    def test_connect_normal_mode_publishes_pushall_and_get_version_separately(self):
+        published = self._connect_publishes(0, False)
+        self.assertEqual(
+            [m for _, m in published],
+            [{"pushing": {"command": "pushall"}}, {"info": {"command": "get_version"}}],
+        )
+        self.assertNotIn("get_history", json.dumps(published))
+
+    def test_connect_failure_publishes_nothing(self):
+        rc = SimpleNamespace(is_failure=True)
+        self.assertEqual(self._connect_publishes(rc, False), [])
+
+    def test_connect_publish_error_does_not_escape(self):
+        driver, _ = make_driver()
+        client = Mock()
+        client.publish.side_effect = RuntimeError("boom")
+        driver._on_connect(SimpleNamespace(command_topic="t"), client, None, None, 0, None)
+        self.assertEqual(client.publish.call_count, 2)
+
     async def test_reconnect_reports_removal_from_mask_without_repeating_trays(self):
         driver, events = make_driver(printer_model="P2S")
         driver._loop = asyncio.get_running_loop()

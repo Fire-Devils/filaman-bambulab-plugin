@@ -124,6 +124,11 @@ class Driver(
             serial=self._serial,
         )
 
+        # Die Library schickt beim Connect ein gebündeltes pushall/get_version/
+        # get_history. Neuere Firmware (Authorization Control, #258) meldet dafür
+        # HMS 0500-0500-0001-0007. Wir senden die Kommandos selbst (_on_connect).
+        self._printer.mqtt_client.pushall_aggressive = False
+
         # Callbacks laufen im paho-Thread
         self._printer.mqtt_client.on_connect_handler = self._on_connect
         self._printer.mqtt_client.on_disconnect_handler = self._on_disconnect
@@ -137,7 +142,7 @@ class Driver(
         )
 
         # MQTT starten (non-blocking: connect_async + loop_start in paho-Thread)
-        # pushall wird automatisch beim Connect gesendet (pushall_on_connect=True)
+        # pushall (und im Normalmodus get_version) sendet _on_connect selbst
         self._printer.mqtt_start()
         logger.info(
             f"Bambu driver started for printer {self.printer_id} at {self._host}"
@@ -254,6 +259,24 @@ class Driver(
             f"Bambu driver connected to printer {self.printer_id} at {self._host}"
         )
         self.log_debug("event", "mqtt", {"event": "connected", "rc": str(rc)})
+        if rc == 0 or not rc.is_failure:
+            self._publish_connect_requests(mqtt_client, client)
+
+    def _publish_connect_requests(self, mqtt_client, client) -> None:
+        # Getrennte, minimale Nachrichten statt des gebündelten Library-Pakets:
+        # Firmware mit Authorization Control (#258) lehnt Bundles/get_history ab.
+        messages = [{"pushing": {"command": "pushall"}}]
+        if not self._read_only:
+            # AMS-Seriennummern kommen aus get_version/push_info (_on_message).
+            messages.append({"info": {"command": "get_version"}})
+        for message in messages:
+            try:
+                client.publish(mqtt_client.command_topic, json.dumps(message))
+            except Exception as exc:
+                logger.warning(
+                    f"Bambu driver could not publish {message} "
+                    f"for printer {self.printer_id}: {exc}"
+                )
 
     def _begin_slot_sync(self) -> None:
         # Keep confirmed occupancy until a fresh mask or tray state replaces it.
