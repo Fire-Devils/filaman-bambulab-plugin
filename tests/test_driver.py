@@ -392,6 +392,37 @@ class InventoryEnrichmentCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(Driver._inventory_enrichment_listener_task)
         self.assertIsNone(Driver._inventory_enrichment_worker_task)
 
+    async def test_inventory_listener_supports_legacy_generator_subscribe(self):
+        driver, _ = make_driver(printer_id=1, resolve_shop_images=True)
+        self.drivers = [driver]
+        Driver._inventory_enrichment_instances.add(driver)
+        Driver._inventory_enrichment_event = asyncio.Event()
+        released = asyncio.Event()
+
+        async def legacy_subscribe():
+            yield "not-json"
+            yield json.dumps({"event": "locations_changed"})
+            yield json.dumps({"event": "spools_changed"})
+            await released.wait()
+
+        class LegacyBus:
+            @staticmethod
+            def subscribe():
+                return legacy_subscribe()
+
+        original_bus = ENRICHMENT_MODULE.event_bus
+        ENRICHMENT_MODULE.event_bus = LegacyBus()
+        task = asyncio.create_task(Driver._inventory_enrichment_event_loop())
+        try:
+            await asyncio.wait_for(Driver._inventory_enrichment_event.wait(), 1.0)
+        finally:
+            released.set()
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            ENRICHMENT_MODULE.event_bus = original_bus
+            Driver._inventory_enrichment_instances.discard(driver)
+            Driver._inventory_enrichment_event = None
+
     async def test_explicit_driver_refresh_reconciles_inventory_images(self):
         driver, _ = make_driver(printer_id=1, resolve_shop_images=True)
         calls = []

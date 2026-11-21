@@ -145,21 +145,32 @@ class CatalogEnrichmentMixin:
             await asyncio.gather(*tasks, return_exceptions=True)
 
     @classmethod
+    async def _consume_inventory_events(cls, events) -> None:
+        async for raw_event in events:
+            if not cls._inventory_enrichment_instances:
+                return
+            try:
+                event_name = json.loads(raw_event).get("event")
+            except (json.JSONDecodeError, AttributeError, TypeError):
+                continue
+            if (
+                event_name in INVENTORY_IMAGE_EVENTS
+                and cls._inventory_enrichment_event is not None
+            ):
+                cls._inventory_enrichment_event.set()
+
+    @classmethod
     async def _inventory_enrichment_event_loop(cls) -> None:
         """Wake the shared worker when any FilaMan source changes inventory."""
         try:
-            async for raw_event in event_bus.subscribe():
-                if not cls._inventory_enrichment_instances:
-                    return
-                try:
-                    event_name = json.loads(raw_event).get("event")
-                except (json.JSONDecodeError, AttributeError, TypeError):
-                    continue
-                if (
-                    event_name in INVENTORY_IMAGE_EVENTS
-                    and cls._inventory_enrichment_event is not None
-                ):
-                    cls._inventory_enrichment_event.set()
+            subscription = event_bus.subscribe()
+            if hasattr(subscription, "__aenter__"):
+                # FilaMan >= 2.2.2: subscribe() is an async context manager.
+                async with subscription as events:
+                    await cls._consume_inventory_events(events)
+            else:
+                # Older FilaMan: subscribe() is an async generator.
+                await cls._consume_inventory_events(subscription)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
