@@ -2,6 +2,7 @@ import asyncio
 import importlib
 import importlib.util
 import json
+import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -1549,6 +1550,39 @@ class ReadOnlyTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(events[-1]["slots"][0]["present"])
         self.assertIsNone(events[-1]["slots"][0]["spool_id"])
         driver._schedule_slot_location_release.assert_called_once_with("0-0")
+
+    async def test_a_report_from_the_mqtt_thread_reaches_filaman(self):
+        # paho delivers on its own thread, where FilaMan's event handler finds
+        # no running loop and drops the event. A slot change must therefore be
+        # worked out, and emitted, on the loop only.
+        driver, _ = make_driver(printer_model="X1C")
+        driver._loop = asyncio.get_running_loop()
+        driver._schedule_slot_location_release = Mock()
+        delivered = []
+
+        def emit_like_filaman(event):
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                return
+            delivered.append(event)
+
+        driver.emit = emit_like_filaman
+        message = SimpleNamespace(
+            topic="device/serial/report",
+            payload=json.dumps({"print": {"command": "push_status", "ams": {
+                "tray_exist_bits": "1",
+                "ams": [{"id": "0", "tray": [{"id": "0", "tray_type": "PLA"}]}],
+            }}}).encode(),
+        )
+
+        mqtt_thread = threading.Thread(target=driver._on_message, args=(None, None, message))
+        mqtt_thread.start()
+        mqtt_thread.join()
+        await asyncio.sleep(0)
+
+        self.assertEqual(len(delivered), 1)
+        self.assertTrue(delivered[0]["slots"][0]["present"])
 
     async def test_direct_assignment_accepts_canonical_and_wire_external_addresses(self):
         driver, _ = make_driver(read_only=True)
