@@ -325,13 +325,14 @@ class Driver(
 
             # push_status Nachrichten verarbeiten
             if isinstance(print_report, dict) and print_report.get("command") == "push_status":
+                # Fed here, not behind _process_slots: that returns early on
+                # messages without tray data, and those carry the temperatures.
+                self._update_display_state(payload)
+                # Slots only on the loop: an event emitted from this paho
+                # thread is dropped by FilaMan, and a second pass here would
+                # leave the loop's pass with nothing left to report.
                 if self._loop:
                     self._loop.call_soon_threadsafe(self._handle_slot_status, payload)
-            if payload.get("print", {}).get("command") == "push_status":
-                # Vor _process_slots: das steigt bei Nachrichten ohne Tray-Daten
-                # früh aus, und genau die tragen die Druckertemperaturen.
-                self._update_display_state(payload)
-                self._process_slots(payload)
                 return
 
             # get_version / push_info: AMS Seriennummern extrahieren
