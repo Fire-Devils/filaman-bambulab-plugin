@@ -25,6 +25,17 @@ from app.services.spool_service import SpoolService
 
 from .catalog import ARTICLE_NUMBER_FIELD, _evict_expired
 
+try:  # Older FilaMan versions do not ship the refill-link service.
+    from app.services.spool_link_service import (
+        LINK_LINKED,
+        LINK_PENDING,
+        propose_spool_link,
+    )
+except ImportError:
+    propose_spool_link = None
+    LINK_PENDING = "pending"
+    LINK_LINKED = "linked"
+
 logger = logging.getLogger(__name__)
 
 AUTO_IMPORT_RETRY_SECONDS = 60
@@ -328,6 +339,48 @@ class SpoolSyncMixin:
             for slot in self._current_slots
         )
 
+    async def _propose_refill_link(
+        self,
+        db: Any,
+        slot: dict[str, Any],
+        tray_uuid: str,
+        tag_uid: str | None,
+        external_id: str,
+        filament_id: int,
+        estimated_weight: float | None,
+    ) -> bool:
+        """Offer FilaMan a chance to link a sealed spool; True means "do not create"."""
+        if propose_spool_link is None:
+            return False
+        slot_label = slot.get("slot_name") or f"Slot {slot.get('slot_index', '')}"
+        try:
+            result = await propose_spool_link(
+                db,
+                external_id=external_id,
+                filament_id=filament_id,
+                source="bambulab",
+                printer_id=self.printer_id,
+                slot_label=slot_label,
+                tag_data={BAMBU_RFID_TAG_1_FIELD: tag_uid} if tag_uid else None,
+                remaining_weight_g=estimated_weight,
+            )
+        except Exception as exc:
+            logger.warning(
+                f"Bambu RFID refill-link proposal failed for tray_uuid={tray_uuid}: {exc}"
+            )
+            return False
+        if result in (LINK_PENDING, LINK_LINKED):
+            logged = self.__dict__.setdefault("_refill_link_logged", set())
+            key = (tray_uuid, result)
+            if key not in logged:
+                logged.add(key)
+                logger.info(
+                    f"Bambu RFID tray {tray_uuid} ({slot_label}): refill link "
+                    f"{result}, not creating a new spool"
+                )
+            return True
+        return False
+
     async def _auto_import_rfid_spools(
         self, slots: list[dict[str, Any]]
     ) -> None:
@@ -373,20 +426,35 @@ class SpoolSyncMixin:
                     ):
                         continue
                     if spool is None:
+                        filament = await self._find_matching_filament(db, slot)
+                        if filament is None:
+                            if self._auto_import_spools:
+                                logger.warning(
+                                    "Bambu RFID spool not imported because no unique matching "
+                                    "FilaMan filament exists: "
+                                    f"tray_uuid={tray_uuid}, "
+                                    f"tray_info_idx={slot.get('tray_info_idx', '')}, "
+                                    f"tray_type={slot.get('tray_type', '')}, "
+                                    f"tray_color={slot.get('tray_color', '')}"
+                                )
+                            continue
+
+                        if await self._propose_refill_link(
+                            db,
+                            slot,
+                            tray_uuid,
+                            tag_uid,
+                            external_id,
+                            filament.id,
+                            estimated_weight,
+                        ):
+                            # A sealed spool is pending or already linked in
+                            # FilaMan, so no new spool may be created here.
+                            continue
+
                         if not self._auto_import_spools:
                             # Nothing known and nothing may be created, so this
                             # tray simply stays unassigned.
-                            continue
-                        filament = await self._find_matching_filament(db, slot)
-                        if filament is None:
-                            logger.warning(
-                                "Bambu RFID spool not imported because no unique matching "
-                                "FilaMan filament exists: "
-                                f"tray_uuid={tray_uuid}, "
-                                f"tray_info_idx={slot.get('tray_info_idx', '')}, "
-                                f"tray_type={slot.get('tray_type', '')}, "
-                                f"tray_color={slot.get('tray_color', '')}"
-                            )
                             continue
 
                         status_result = await db.execute(

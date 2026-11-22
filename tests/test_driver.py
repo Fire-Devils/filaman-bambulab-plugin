@@ -2006,6 +2006,65 @@ class AutoImportDatabaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(count, 2)
         self.assertIsNotNone(imported)
 
+    async def _import_with_link_result(self, result=None, *, raises=None,
+                                       missing=False, auto_import=True):
+        self.driver._auto_import_spools = auto_import
+        propose = AsyncMock(return_value=result, side_effect=raises)
+        target = None if missing else propose
+        with patch.object(SPOOL_SYNC_MODULE, "propose_spool_link", target):
+            await self.driver._auto_import_rfid_spools([self.slot])
+        async with self.sessions() as db:
+            count = await db.scalar(select(func.count()).select_from(Spool))
+        return propose, count
+
+    async def test_refill_link_pending_creates_no_spool(self):
+        propose, count = await self._import_with_link_result("pending")
+        self.assertEqual(count, 0)
+        kwargs = propose.await_args.kwargs
+        self.assertEqual(
+            kwargs["external_id"], "bambulab:AABBCCDDEEFF0011AABBCCDDEEFF0011"
+        )
+        self.assertEqual(kwargs["source"], "bambulab")
+        self.assertEqual(kwargs["slot_label"], "AMS 1 - Slot 1")
+        self.assertEqual(
+            kwargs["tag_data"],
+            {SPOOL_SYNC_MODULE.BAMBU_RFID_TAG_1_FIELD: "A1B2C3D4E5F60102"},
+        )
+
+    async def test_refill_link_linked_creates_no_spool(self):
+        _, count = await self._import_with_link_result("linked")
+        self.assertEqual(count, 0)
+
+    async def test_refill_link_dismissed_creates_spool(self):
+        _, count = await self._import_with_link_result("dismissed")
+        self.assertEqual(count, 1)
+
+    async def test_refill_link_no_candidates_creates_spool(self):
+        _, count = await self._import_with_link_result("no_candidates")
+        self.assertEqual(count, 1)
+
+    async def test_refill_link_missing_service_creates_spool(self):
+        _, count = await self._import_with_link_result(missing=True)
+        self.assertEqual(count, 1)
+
+    async def test_refill_link_proposed_when_auto_import_off(self):
+        propose, count = await self._import_with_link_result(
+            "pending", auto_import=False
+        )
+        propose.assert_awaited_once()
+        self.assertEqual(count, 0)
+
+    async def test_refill_link_no_candidates_auto_import_off_creates_nothing(self):
+        propose, count = await self._import_with_link_result(
+            "no_candidates", auto_import=False
+        )
+        propose.assert_awaited_once()
+        self.assertEqual(count, 0)
+
+    async def test_refill_link_error_falls_back_to_import(self):
+        _, count = await self._import_with_link_result(raises=RuntimeError("boom"))
+        self.assertEqual(count, 1)
+
     async def test_assigning_a_tray_clears_the_spool_that_was_there(self):
         """A tray holds one spool, so the previous one has to let go."""
         first = await self._spool_carrying({})
