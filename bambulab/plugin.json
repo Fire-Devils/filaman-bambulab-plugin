@@ -20,46 +20,150 @@
         "description": "Select your Bambu Lab printer model. Determines AMS data structure handling.",
         "enum": ["P1S", "P1P", "X1C", "X1E", "A1", "A1_MINI", "H2C", "H2D", "H2S", "P2S"],
         "enumNames": ["P1S", "P1P", "X1 Carbon", "X1E", "A1", "A1 Mini", "H2C", "H2D", "H2S", "P2S"],
-        "default": "P1S"
+        "default": "P1S",
+        "x-i18n": {
+          "de": {
+            "title": "Druckermodell",
+            "description": "Wählen Sie Ihr Bambu-Lab-Druckermodell. Bestimmt die Verarbeitung der AMS-Datenstruktur.",
+            "enumNames": [
+              "P1S",
+              "P1P",
+              "X1 Carbon",
+              "X1E",
+              "A1",
+              "A1 Mini",
+              "H2C",
+              "H2D",
+              "H2S",
+              "P2S"
+            ]
+          },
+          "fr": {
+            "title": "Modèle d’imprimante",
+            "description": "Sélectionnez le modèle de votre imprimante Bambu Lab. Détermine le traitement de la structure de données AMS.",
+            "enumNames": [
+              "P1S",
+              "P1P",
+              "X1 Carbon",
+              "X1E",
+              "A1",
+              "A1 Mini",
+              "H2C",
+              "H2D",
+              "H2S",
+              "P2S"
+            ]
+          }
+        }
       },
       "host": {
         "type": "string",
         "title": "IP/Hostname",
-        "description": "IP address or hostname of the Bambu printer"
+        "description": "IP address or hostname of the Bambu printer",
+        "x-i18n": {
+          "de": {
+            "title": "IP/Hostname",
+            "description": "IP-Adresse oder Hostname des Bambu-Druckers"
+          },
+          "fr": {
+            "title": "IP/nom d’hôte",
+            "description": "Adresse IP ou nom d’hôte de l’imprimante Bambu"
+          }
+        }
       },
       "serial": {
         "type": "string",
         "title": "Serial Number",
-        "description": "Printer serial number"
+        "description": "Printer serial number",
+        "x-i18n": {
+          "de": {
+            "title": "Seriennummer",
+            "description": "Seriennummer des Druckers"
+          },
+          "fr": {
+            "title": "Numéro de série",
+            "description": "Numéro de série de l’imprimante"
+          }
+        }
       },
       "access_code": {
         "type": "string",
         "title": "Access Code",
-        "description": "Printer access code"
+        "description": "Printer access code",
+        "x-i18n": {
+          "de": {
+            "title": "Zugangscode",
+            "description": "Zugangscode des Druckers"
+          },
+          "fr": {
+            "title": "Code d’accès",
+            "description": "Code d’accès de l’imprimante"
+          }
+        }
       },
       "read_only": {
         "type": "boolean",
         "title": "Read-only Mode",
         "description": "Read printer and AMS status, but never send state-changing commands to the printer",
-        "default": false
+        "default": false,
+        "x-i18n": {
+          "de": {
+            "title": "Schreibgeschützter Modus",
+            "description": "Liest Drucker- und AMS-Status, sendet aber nie zustandsändernde Befehle an den Drucker"
+          },
+          "fr": {
+            "title": "Mode lecture seule",
+            "description": "Lit l’état de l’imprimante et de l’AMS, mais n’envoie jamais de commandes modifiant l’état à l’imprimante"
+          }
+        }
       },
       "auto_import_spools": {
         "type": "boolean",
         "title": "Automatically Import Bambu RFID Spools",
         "description": "Create unknown Bambu RFID spools from existing filaments",
-        "default": false
+        "default": false,
+        "x-i18n": {
+          "de": {
+            "title": "Bambu-RFID-Spulen automatisch importieren",
+            "description": "Legt unbekannte Bambu-RFID-Spulen aus vorhandenen Filamenten an"
+          },
+          "fr": {
+            "title": "Importer automatiquement les bobines RFID Bambu",
+            "description": "Crée les bobines RFID Bambu inconnues à partir des filaments existants"
+          }
+        }
       },
       "sync_spool_weight": {
         "type": "boolean",
         "title": "Synchronize Estimated Spool Weight",
         "description": "Set and update remaining spool weight from Bambu Lab's tray weight and remaining-percentage estimates during automatic spool import",
-        "default": false
+        "default": false,
+        "x-i18n": {
+          "de": {
+            "title": "Geschätztes Spulengewicht synchronisieren",
+            "description": "Setzt und aktualisiert das Restgewicht der Spule beim automatischen Spulenimport anhand der Tray-Gewichts- und Restprozent-Schätzungen von Bambu Lab"
+          },
+          "fr": {
+            "title": "Synchroniser le poids estimé de la bobine",
+            "description": "Définit et met à jour le poids restant de la bobine lors de l’importation automatique, d’après les estimations de poids du tray et de pourcentage restant de Bambu Lab"
+          }
+        }
       },
       "resolve_shop_images": {
         "type": "boolean",
         "title": "Catalog Images (Bambu Lab)",
         "description": "Resolve color-specific images through Bambu Lab's EU Store Search API, with a product-page fallback, and store only their URLs on the matching FilaMan filament. Browsers load enabled images directly from Bambu Lab's CDN; no image files are stored locally.",
-        "default": false
+        "default": false,
+        "x-i18n": {
+          "de": {
+            "title": "Katalogbilder (Bambu Lab)",
+            "description": "Ermittelt farbspezifische Bilder über die EU-Store-Search-API von Bambu Lab, mit Produktseiten-Fallback, und speichert nur deren URLs am passenden FilaMan-Filament. Browser laden aktivierte Bilder direkt vom CDN von Bambu Lab; es werden keine Bilddateien lokal gespeichert."
+          },
+          "fr": {
+            "title": "Images du catalogue (Bambu Lab)",
+            "description": "Récupère les images spécifiques à la couleur via l’API Store Search UE de Bambu Lab, avec repli sur la page produit, et n’enregistre que leurs URL sur le filament FilaMan correspondant. Les navigateurs chargent les images activées directement depuis le CDN de Bambu Lab ; aucun fichier image n’est stocké localement."
+          }
+        }
       },
       "reconnect_interval_minutes": {
         "type": "integer",
@@ -67,7 +171,17 @@
         "description": "Interval in minutes between reconnection attempts on connection loss",
         "default": 5,
         "minimum": 1,
-        "maximum": 60
+        "maximum": 60,
+        "x-i18n": {
+          "de": {
+            "title": "Wiederverbindungsintervall (Minuten)",
+            "description": "Abstand in Minuten zwischen Wiederverbindungsversuchen nach Verbindungsverlust"
+          },
+          "fr": {
+            "title": "Intervalle de reconnexion (minutes)",
+            "description": "Intervalle en minutes entre les tentatives de reconnexion après une perte de connexion"
+          }
+        }
       }
     },
     "required": ["printer_model", "host", "serial", "access_code"]
