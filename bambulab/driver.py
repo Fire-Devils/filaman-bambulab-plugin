@@ -330,8 +330,9 @@ class Driver(
             if payload.get("print", {}).get("command") == "push_status":
                 # Vor _process_slots: das steigt bei Nachrichten ohne Tray-Daten
                 # früh aus, und genau die tragen die Druckertemperaturen.
+                # Slots laufen nur über _handle_slot_status im Event-Loop: emit
+                # aus dem paho-Thread findet keinen Loop und verwirft das Update.
                 self._update_display_state(payload)
-                self._process_slots(payload)
                 return
 
             # get_version / push_info: AMS Seriennummern extrahieren

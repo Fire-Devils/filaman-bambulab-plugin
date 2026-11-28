@@ -2,6 +2,7 @@ import asyncio
 import importlib
 import importlib.util
 import json
+import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -1521,6 +1522,35 @@ class ReadOnlyTests(unittest.IsolatedAsyncioTestCase):
         client.publish.side_effect = RuntimeError("boom")
         driver._on_connect(SimpleNamespace(command_topic="t"), client, None, None, 0, None)
         self.assertEqual(client.publish.call_count, 2)
+
+    async def test_push_status_from_mqtt_thread_emits_on_event_loop(self):
+        # paho calls _on_message in its own thread; FilaMan's event handler
+        # needs a running loop, so slot updates must be emitted on the loop.
+        emit_threads = []
+        driver = Driver(
+            printer_id=1,
+            config={"printer_model": "P1S"},
+            emitter=lambda event: emit_threads.append(
+                (asyncio.get_running_loop(), threading.get_ident())
+            ),
+        )
+        driver._running = True
+        driver._loop = asyncio.get_running_loop()
+        driver._schedule_slot_location_update = Mock()
+        driver._schedule_slot_location_release = Mock()
+        message = Mock(topic="device/serial/report")
+        message.payload = json.dumps({"print": {"command": "push_status", "ams": {
+            "tray_exist_bits": "1",
+            "ams": [{"id": "0", "tray": [{"id": "0", "tray_type": "PLA"}]}],
+        }}}).encode()
+
+        worker = threading.Thread(target=driver._on_message, args=(None, None, message))
+        worker.start()
+        worker.join()
+        await asyncio.sleep(0)
+
+        self.assertEqual(len(emit_threads), 1)
+        self.assertEqual(emit_threads[0][1], threading.get_ident())
 
     async def test_reconnect_reports_removal_from_mask_without_repeating_trays(self):
         driver, events = make_driver(printer_model="P2S")
